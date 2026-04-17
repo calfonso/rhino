@@ -1089,19 +1089,6 @@ impl Backend for SqliteBackend {
             .list_internal(&like_prefix, effective_start, limit, revision, false, keys_only)
             .await?;
 
-        // Match kine's relist behavior: if revision=0 and result is empty,
-        // retry at the current revision to handle create/list race
-        if revision == 0 && events.is_empty() {
-            let current = self.cached_revision().await?;
-            if current > 0 {
-                let (rev2, events2) = self
-                    .list_internal(&like_prefix, effective_start, limit, current, false, keys_only)
-                    .await?;
-                let kvs = events2.into_iter().map(|e| e.kv).collect();
-                return Ok((rev2, kvs));
-            }
-        }
-
         let kvs = events.into_iter().map(|e| e.kv).collect();
         Ok((rev, kvs))
     }
@@ -1158,13 +1145,10 @@ impl Backend for SqliteBackend {
             Ok((rev, row.1))
         } else {
             // Historical count via GROUP BY subquery
-            let (extra_where, query) = if effective_start.is_empty() {
-                (format!("AND mkv.id <= {revision}"), None)
+            let start_where = if effective_start.is_empty() {
+                String::new()
             } else {
-                (
-                    format!("AND mkv.name >= ? AND mkv.id <= {revision}"),
-                    Some(effective_start.to_string()),
-                )
+                "AND mkv.name >= ?".to_string()
             };
 
             let sql = format!(
@@ -1178,22 +1162,25 @@ impl Backend for SqliteBackend {
                         SELECT MAX(mkv.id) AS id
                         FROM kine AS mkv
                         WHERE mkv.name LIKE ? ESCAPE '^'
-                        {extra_where}
+                        {start_where}
+                        AND mkv.id <= ?
                         GROUP BY mkv.name
                     ) AS maxkv ON maxkv.id = kv.id
                     WHERE kv.deleted = 0
                 ) c"
             );
 
-            let row = if let Some(ref sk) = query {
+            let row = if effective_start.is_empty() {
                 sqlx::query_as::<_, (Option<i64>, i64)>(&sql)
                     .bind(&like_prefix)
-                    .bind(sk)
+                    .bind(revision)
                     .fetch_one(&self.pool)
                     .await
             } else {
                 sqlx::query_as::<_, (Option<i64>, i64)>(&sql)
                     .bind(&like_prefix)
+                    .bind(effective_start)
+                    .bind(revision)
                     .fetch_one(&self.pool)
                     .await
             }
