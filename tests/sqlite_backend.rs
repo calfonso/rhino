@@ -474,6 +474,403 @@ async fn test_db_size() {
 }
 
 // ---------------------------------------------------------------------------
+// Compaction safety tests — verify the prev_revision=0 fix
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_compact_does_not_delete_live_keys() {
+    // Regression test: compaction must never delete the latest (only) revision
+    // of a key. This was broken when create() set prev_revision to the current
+    // max revision instead of 0, causing cross-key prev_revision references.
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("compact_live.db");
+    let dsn = db_path.to_string_lossy().to_string();
+
+    let config = SqliteConfig {
+        dsn: dsn.clone(),
+        compact_interval: Duration::ZERO,
+        compact_min_retain: 5,
+        compact_batch_size: 1000,
+        ..Default::default()
+    };
+    let backend = SqliteBackend::new(config).await.unwrap();
+    backend.start().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Create several keys (like Kubernetes bootstrap).
+    backend.create("/registry/ns/default", b"ns1", 0).await.unwrap();
+    backend.create("/registry/ns/kube-system", b"ns2", 0).await.unwrap();
+    backend.create("/registry/ns/kube-public", b"ns3", 0).await.unwrap();
+    backend.create("/registry/sa/default", b"sa1", 0).await.unwrap();
+    backend.create("/registry/sa/kube-system", b"sa2", 0).await.unwrap();
+
+    // Generate enough revisions to push past compact_min_retain.
+    let r = backend.create("/registry/padding/key", b"v0", 0).await.unwrap();
+    let mut rev = r;
+    for i in 1..=20 {
+        let val = format!("v{i}");
+        let (new_rev, _, ok) = backend
+            .update("/registry/padding/key", val.as_bytes(), rev, 0)
+            .await
+            .unwrap();
+        assert!(ok);
+        rev = new_rev;
+    }
+
+    // Run compaction.
+    let current = backend.current_revision().await.unwrap();
+    backend.compact(current).await.unwrap();
+
+    // ALL bootstrap keys must still be readable.
+    for (key, expected) in [
+        ("/registry/ns/default", b"ns1".as_slice()),
+        ("/registry/ns/kube-system", b"ns2".as_slice()),
+        ("/registry/ns/kube-public", b"ns3".as_slice()),
+        ("/registry/sa/default", b"sa1".as_slice()),
+        ("/registry/sa/kube-system", b"sa2".as_slice()),
+    ] {
+        let (_, kv) = backend.get(key, "", 0, 0, false).await.unwrap();
+        let kv = kv.unwrap_or_else(|| panic!("key {key} should exist after compaction"));
+        assert_eq!(kv.value, expected, "wrong value for {key}");
+    }
+
+    // List must return all namespace keys.
+    let (_, kvs) = backend.list("/registry/ns/", "", 0, 0, false).await.unwrap();
+    assert_eq!(kvs.len(), 3, "all 3 namespace keys should survive compaction");
+
+    // The padding key should have latest value.
+    let (_, kv) = backend.get("/registry/padding/key", "", 0, 0, false).await.unwrap();
+    assert_eq!(kv.unwrap().value, b"v20");
+}
+
+#[tokio::test]
+async fn test_compact_removes_deleted_keys_from_kine_current() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("compact_current.db");
+    let dsn = db_path.to_string_lossy().to_string();
+
+    let config = SqliteConfig {
+        dsn: dsn.clone(),
+        compact_interval: Duration::ZERO,
+        compact_min_retain: 2,
+        compact_batch_size: 1000,
+        ..Default::default()
+    };
+    let backend = SqliteBackend::new(config).await.unwrap();
+    backend.start().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Create and delete a key.
+    let rev = backend.create("/del/key", b"v1", 0).await.unwrap();
+    backend.delete("/del/key", rev).await.unwrap();
+
+    // Generate padding revisions.
+    for i in 0..10 {
+        let key = format!("/pad/{i}");
+        backend.create(&key, b"x", 0).await.unwrap();
+    }
+
+    // Compact.
+    let current = backend.current_revision().await.unwrap();
+    backend.compact(current).await.unwrap();
+
+    // The deleted key should not appear in list results.
+    let (_, kvs) = backend.list("/del/", "", 0, 0, false).await.unwrap();
+    assert_eq!(kvs.len(), 0, "deleted key should not appear in list");
+
+    // Verify kine_current was cleaned up.
+    let pool = sqlx::sqlite::SqlitePool::connect(&format!("sqlite:{dsn}"))
+        .await
+        .unwrap();
+    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM kine_current WHERE name = '/del/key'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(row.0, 0, "kine_current should not have entry for deleted+compacted key");
+    pool.close().await;
+}
+
+// ---------------------------------------------------------------------------
+// kine_current consistency tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_kine_current_stays_consistent() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("kine_current_consistency.db");
+    let dsn = db_path.to_string_lossy().to_string();
+
+    let config = SqliteConfig {
+        dsn,
+        compact_interval: Duration::ZERO,
+        ..Default::default()
+    };
+    let backend = SqliteBackend::new(config).await.unwrap();
+    backend.start().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Create, update, delete, re-create cycle.
+    let r1 = backend.create("/kc/k", b"v1", 0).await.unwrap();
+    let (r2, _, _) = backend.update("/kc/k", b"v2", r1, 0).await.unwrap();
+    backend.delete("/kc/k", r2).await.unwrap();
+    let r4 = backend.create("/kc/k", b"v3", 0).await.unwrap();
+
+    // List at current should return v3.
+    let (_, kvs) = backend.list("/kc/", "", 0, 0, false).await.unwrap();
+    assert_eq!(kvs.len(), 1);
+    assert_eq!(kvs[0].value, b"v3");
+    assert_eq!(kvs[0].mod_revision, r4);
+
+    // Get should also return v3.
+    let (_, kv) = backend.get("/kc/k", "", 0, 0, false).await.unwrap();
+    let kv = kv.unwrap();
+    assert_eq!(kv.value, b"v3");
+
+    // Count should be 1.
+    let (_, count) = backend.count("/kc/", "", 0).await.unwrap();
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn test_list_returns_results_immediately_after_create() {
+    // Verify kine_current is updated synchronously: a list immediately
+    // after create must return the key.
+    let (backend, _dir) = test_backend().await;
+
+    for i in 0..10 {
+        let key = format!("/immediate/{i}");
+        backend.create(&key, b"val", 0).await.unwrap();
+
+        // List immediately — should see all keys created so far.
+        let (_, kvs) = backend.list("/immediate/", "", 0, 0, false).await.unwrap();
+        assert_eq!(
+            kvs.len(),
+            i + 1,
+            "list after creating key {i} should return {} keys, got {}",
+            i + 1,
+            kvs.len()
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Count tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_count_current_revision() {
+    let (backend, _dir) = test_backend().await;
+
+    backend.create("/cnt/a", b"1", 0).await.unwrap();
+    backend.create("/cnt/b", b"2", 0).await.unwrap();
+    backend.create("/cnt/c", b"3", 0).await.unwrap();
+
+    let (_, count) = backend.count("/cnt/", "", 0).await.unwrap();
+    assert_eq!(count, 3);
+
+    // Delete one.
+    let (_, kv) = backend.get("/cnt/b", "", 0, 0, false).await.unwrap();
+    backend.delete("/cnt/b", kv.unwrap().mod_revision).await.unwrap();
+
+    let (_, count) = backend.count("/cnt/", "", 0).await.unwrap();
+    assert_eq!(count, 2);
+}
+
+#[tokio::test]
+async fn test_count_historical_revision() {
+    let (backend, _dir) = test_backend().await;
+
+    let r1 = backend.create("/ch/a", b"1", 0).await.unwrap();
+    let r2 = backend.create("/ch/b", b"2", 0).await.unwrap();
+    backend.create("/ch/c", b"3", 0).await.unwrap();
+
+    // Count at revision after first 2 creates.
+    let (_, count) = backend.count("/ch/", "", r2).await.unwrap();
+    assert_eq!(count, 2);
+
+    // Count at revision after first create.
+    let (_, count) = backend.count("/ch/", "", r1).await.unwrap();
+    assert_eq!(count, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Edge case tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_update_nonexistent_key() {
+    let (backend, _dir) = test_backend().await;
+
+    let (_, kv, ok) = backend.update("/noexist/k", b"v", 1, 0).await.unwrap();
+    assert!(!ok, "update of nonexistent key should fail");
+    assert!(kv.is_none());
+}
+
+#[tokio::test]
+async fn test_delete_already_deleted() {
+    let (backend, _dir) = test_backend().await;
+
+    let rev = backend.create("/deldel/k", b"v", 0).await.unwrap();
+    let (_, _, ok) = backend.delete("/deldel/k", rev).await.unwrap();
+    assert!(ok);
+
+    // Delete again — should return false (already deleted).
+    let (_, kv, ok) = backend.delete("/deldel/k", 0).await.unwrap();
+    assert!(!ok, "deleting already-deleted key should return false");
+    assert!(kv.is_none());
+}
+
+#[tokio::test]
+async fn test_delete_never_existed() {
+    let (backend, _dir) = test_backend().await;
+
+    let (_, kv, ok) = backend.delete("/never/existed", 0).await.unwrap();
+    assert!(ok, "deleting non-existent key should return true");
+    assert!(kv.is_none());
+}
+
+#[tokio::test]
+async fn test_list_future_revision_error() {
+    let (backend, _dir) = test_backend().await;
+
+    let current = backend.current_revision().await.unwrap();
+    let result = backend.list("/any/", "", 0, current + 100, false).await;
+    assert!(
+        matches!(result, Err(BackendError::FutureRev)),
+        "listing at future revision should return FutureRev error"
+    );
+}
+
+#[tokio::test]
+async fn test_watch_compacted_revision_error() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("watch_compact.db");
+
+    let config = SqliteConfig {
+        dsn: db_path.to_string_lossy().to_string(),
+        compact_interval: Duration::ZERO,
+        compact_min_retain: 2,
+        compact_batch_size: 1000,
+        ..Default::default()
+    };
+    let backend = SqliteBackend::new(config).await.unwrap();
+    backend.start().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Create enough data to compact.
+    let r = backend.create("/wc/key", b"v0", 0).await.unwrap();
+    let mut rev = r;
+    for i in 1..=10 {
+        let (new_rev, _, _) = backend
+            .update("/wc/key", format!("v{i}").as_bytes(), rev, 0)
+            .await
+            .unwrap();
+        rev = new_rev;
+    }
+
+    // Compact.
+    let current = backend.current_revision().await.unwrap();
+    backend.compact(current).await.unwrap();
+
+    // Watch at a compacted revision should return error.
+    let result = backend.watch("/wc/", 1).await;
+    assert!(
+        matches!(result, Err(BackendError::Compacted)),
+        "watching at compacted revision should return Compacted error"
+    );
+}
+
+#[tokio::test]
+async fn test_create_after_delete_preserves_old_value() {
+    // Verify C2 fix: old_value stores the deleted key's value on re-create.
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("old_value.db");
+    let dsn = db_path.to_string_lossy().to_string();
+
+    let config = SqliteConfig {
+        dsn: dsn.clone(),
+        compact_interval: Duration::ZERO,
+        ..Default::default()
+    };
+    let backend = SqliteBackend::new(config).await.unwrap();
+    backend.start().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Create, delete, re-create.
+    let rev = backend.create("/ov/k", b"original", 0).await.unwrap();
+    backend.delete("/ov/k", rev).await.unwrap();
+    let new_rev = backend.create("/ov/k", b"new_value", 0).await.unwrap();
+
+    // Check the raw kine row for old_value.
+    let pool = sqlx::sqlite::SqlitePool::connect(&format!("sqlite:{dsn}"))
+        .await
+        .unwrap();
+    let row: (Vec<u8>,) = sqlx::query_as("SELECT old_value FROM kine WHERE id = ?")
+        .bind(new_rev)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        row.0, b"original",
+        "old_value should contain the deleted key's value"
+    );
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn test_prev_revision_zero_for_new_keys() {
+    // Verify the root-cause fix: new keys get prev_revision=0, not current rev.
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("prev_rev.db");
+    let dsn = db_path.to_string_lossy().to_string();
+
+    let config = SqliteConfig {
+        dsn: dsn.clone(),
+        compact_interval: Duration::ZERO,
+        ..Default::default()
+    };
+    let backend = SqliteBackend::new(config).await.unwrap();
+    backend.start().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let rev = backend.create("/prev/new_key", b"val", 0).await.unwrap();
+
+    let pool = sqlx::sqlite::SqlitePool::connect(&format!("sqlite:{dsn}"))
+        .await
+        .unwrap();
+    let row: (i64,) = sqlx::query_as("SELECT prev_revision FROM kine WHERE id = ?")
+        .bind(rev)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        row.0, 0,
+        "prev_revision for a brand-new key must be 0"
+    );
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn test_list_with_start_key_equals_prefix() {
+    // Verify D78: when startKey == prefix, startKey is cleared.
+    let (backend, _dir) = test_backend().await;
+
+    backend.create("/sk/a", b"1", 0).await.unwrap();
+    backend.create("/sk/b", b"2", 0).await.unwrap();
+    backend.create("/sk/c", b"3", 0).await.unwrap();
+
+    // List with startKey == prefix — should return all keys.
+    let (_, kvs) = backend.list("/sk/", "/sk/", 0, 0, false).await.unwrap();
+    assert_eq!(kvs.len(), 3, "startKey == prefix should list all keys");
+
+    // List with startKey after some keys.
+    let (_, kvs) = backend.list("/sk/", "/sk/b", 0, 0, false).await.unwrap();
+    assert_eq!(kvs.len(), 2, "startKey /sk/b should skip /sk/a");
+    assert_eq!(kvs[0].key, "/sk/b");
+    assert_eq!(kvs[1].key, "/sk/c");
+}
+
+// ---------------------------------------------------------------------------
 // Helpers (ported from kine helper_test.go)
 // ---------------------------------------------------------------------------
 
