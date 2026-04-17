@@ -725,7 +725,12 @@ impl Backend for PostgresBackend {
             .map(|e| e.kv.mod_revision)
             .unwrap_or(0);
 
-        self.insert(key, true, false, 0, prev_revision, lease, value, b"")
+        let old_value = existing
+            .as_ref()
+            .map(|e| e.kv.value.as_slice())
+            .unwrap_or(b"");
+
+        self.insert(key, true, false, 0, prev_revision, lease, value, old_value)
             .await
     }
 

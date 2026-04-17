@@ -50,14 +50,14 @@ impl<B: Backend> Maintenance for KvBridge<B> {
         &self,
         _request: Request<HashRequest>,
     ) -> Result<Response<HashResponse>, Status> {
-        Err(Status::unimplemented("hash is not implemented"))
+        Err(Status::unknown("hash is not supported"))
     }
 
     async fn hash_kv(
         &self,
         _request: Request<HashKvRequest>,
     ) -> Result<Response<HashKvResponse>, Status> {
-        Err(Status::unimplemented("hashKV is not implemented"))
+        Err(Status::unknown("hash kv is not supported"))
     }
 
     type SnapshotStream =
@@ -67,20 +67,20 @@ impl<B: Backend> Maintenance for KvBridge<B> {
         &self,
         _request: Request<SnapshotRequest>,
     ) -> Result<Response<Self::SnapshotStream>, Status> {
-        Err(Status::unimplemented("snapshot is not implemented"))
+        Err(Status::unknown("snapshot is not supported"))
     }
 
     async fn move_leader(
         &self,
         _request: Request<MoveLeaderRequest>,
     ) -> Result<Response<MoveLeaderResponse>, Status> {
-        Err(Status::unimplemented("moveLeader is not implemented"))
+        Err(Status::unknown("move leader is not supported"))
     }
 
     async fn downgrade(
         &self,
         _request: Request<DowngradeRequest>,
     ) -> Result<Response<DowngradeResponse>, Status> {
-        Err(Status::unimplemented("downgrade is not implemented"))
+        Err(Status::unknown("downgrade is not supported"))
     }
 }

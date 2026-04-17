@@ -566,15 +566,11 @@ impl<B: Backend> KvBridge<B> {
                 rev
             };
 
+            // Kine returns no ResponseOps on compact success
             Ok(TxnResponse {
                 header: response_header(rev),
                 succeeded: true,
-                responses: vec![ResponseOp {
-                    response: Some(response_op::Response::ResponsePut(PutResponse {
-                        header: response_header(rev),
-                        prev_kv: None,
-                    })),
-                }],
+                responses: vec![],
             })
         } else {
             // Version mismatch — return current state
@@ -587,17 +583,17 @@ impl<B: Backend> KvBridge<B> {
                 proto
             });
             let kvs = kv.into_iter().collect::<Vec<_>>();
-            let count = kvs.len() as i64;
 
+            // Kine returns empty inner header and Count: 1
             Ok(TxnResponse {
                 header: response_header(current_rev),
                 succeeded: false,
                 responses: vec![ResponseOp {
                     response: Some(response_op::Response::ResponseRange(
                         RangeResponse {
-                            header: response_header(current_rev),
+                            header: Some(ResponseHeader::default()),
                             kvs,
-                            count,
+                            count: 1,
                             more: false,
                         },
                     )),
@@ -662,6 +658,30 @@ impl<B: Backend> Kv for KvBridge<B> {
         request: Request<RangeRequest>,
     ) -> Result<Response<RangeResponse>, Status> {
         let r = request.into_inner();
+
+        // Reject unsupported Range options (matching kine)
+        if r.max_create_revision != 0 {
+            return Err(Status::unimplemented("maxCreateRevision is not implemented"));
+        }
+        if r.sort_order != 0 {
+            return Err(Status::unimplemented("sortOrder is not implemented"));
+        }
+        if r.sort_target != 0 {
+            return Err(Status::unimplemented("sortTarget is not implemented"));
+        }
+        if r.serializable {
+            return Err(Status::unimplemented("serializable is not implemented"));
+        }
+        if r.min_mod_revision != 0 {
+            return Err(Status::unimplemented("minModRevision is not implemented"));
+        }
+        if r.min_create_revision != 0 {
+            return Err(Status::unimplemented("minCreateRevision is not implemented"));
+        }
+        if r.max_mod_revision != 0 {
+            return Err(Status::unimplemented("maxModRevision is not implemented"));
+        }
+
         let resp = self.handle_range(&r).await?;
         Ok(Response::new(resp))
     }
@@ -671,7 +691,17 @@ impl<B: Backend> Kv for KvBridge<B> {
         request: Request<PutRequest>,
     ) -> Result<Response<PutResponse>, Status> {
         let put = request.into_inner();
-        let key = String::from_utf8_lossy(&put.key);
+
+        // Reject unsupported Put options (matching kine)
+        if put.ignore_value {
+            return Err(Status::unimplemented("ignoreValue is not implemented"));
+        }
+        if put.ignore_lease {
+            return Err(Status::unimplemented("ignoreLease is not implemented"));
+        }
+
+        let raw_key = String::from_utf8_lossy(&put.key);
+        let key = redirect_key(&raw_key);
 
         // Try create first; if key exists, update unconditionally.
         match self.backend.create(&key, &put.value, put.lease).await {
@@ -708,28 +738,9 @@ impl<B: Backend> Kv for KvBridge<B> {
 
     async fn delete_range(
         &self,
-        request: Request<DeleteRangeRequest>,
+        _request: Request<DeleteRangeRequest>,
     ) -> Result<Response<DeleteRangeResponse>, Status> {
-        let req = request.into_inner();
-        let key = String::from_utf8_lossy(&req.key);
-
-        let (rev, kv, ok) = self
-            .backend
-            .delete(&key, 0)
-            .await
-            .map_err(backend_err_to_status)?;
-
-        let deleted = if ok { 1 } else { 0 };
-        let prev_kvs = if req.prev_kv {
-            to_proto_kvs(kv.as_ref())
-        } else {
-            vec![]
-        };
-        Ok(Response::new(DeleteRangeResponse {
-            header: response_header(rev),
-            deleted,
-            prev_kvs,
-        }))
+        Err(Status::unimplemented("delete is not implemented"))
     }
 
     async fn txn(
@@ -766,7 +777,7 @@ impl<B: Backend> Kv for KvBridge<B> {
         }
 
         Err(Status::invalid_argument(
-            "unsupported transaction pattern",
+            "etcdserver: unsupported operations in txn request",
         ))
     }
 

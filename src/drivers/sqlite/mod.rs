@@ -53,8 +53,8 @@ impl Default for SqliteConfig {
 /// SQLite-backed implementation of the rhino [`Backend`] trait.
 pub struct SqliteBackend {
     pool: SqlitePool,
-    current_rev: AtomicI64,
-    notify: Notify,
+    current_rev: Arc<AtomicI64>,
+    notify: Arc<Notify>,
     broadcast_tx: broadcast::Sender<Vec<Event>>,
     config: SqliteConfig,
 }
@@ -76,7 +76,7 @@ impl SqliteBackend {
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .locking_mode(SqliteLockingMode::Normal)
-            .synchronous(SqliteSynchronous::Normal)
+            .synchronous(SqliteSynchronous::Full)
             .busy_timeout(Duration::from_secs(30))
             .pragma("cache_size", "-2000")
             .pragma("auto_vacuum", "incremental");
@@ -102,8 +102,8 @@ impl SqliteBackend {
 
         Ok(Self {
             pool,
-            current_rev: AtomicI64::new(0),
-            notify: Notify::new(),
+            current_rev: Arc::new(AtomicI64::new(0)),
+            notify: Arc::new(Notify::new()),
             broadcast_tx,
             config,
         })
@@ -231,7 +231,7 @@ impl SqliteBackend {
         let name = format!("gap-{revision}");
         sqlx::query(
             "INSERT OR IGNORE INTO kine(id, name, created, deleted, create_revision, prev_revision, lease, value, old_value)
-             VALUES(?, ?, 0, 1, 1, 0, 0, NULL, NULL)",
+             VALUES(?, ?, 0, 1, 0, 0, 0, NULL, NULL)",
         )
         .bind(revision)
         .bind(&name)
@@ -874,33 +874,20 @@ impl Backend for SqliteBackend {
             Err(e) => warn!("failed to create health check key: {e}"),
         }
 
-        // Start background poll and compact loops.
-        // We need Arc<Self> for these, so we wrap via a clone of the pool.
-        // Since SqliteBackend is expected to live behind Arc in RhinoServer,
-        // we create lightweight clones of the needed state.
-        let poll_self = Arc::new(SqliteBackend {
+        // Start background loops. All share the same pool, current_rev,
+        // notify, and broadcast_tx via Arc, so inserts on the main instance
+        // wake the poll loop and revision updates are visible everywhere.
+        let shared = Arc::new(SqliteBackend {
             pool: self.pool.clone(),
-            current_rev: AtomicI64::new(self.current_rev.load(Ordering::Acquire)),
-            notify: Notify::new(),
+            current_rev: self.current_rev.clone(),
+            notify: self.notify.clone(),
             broadcast_tx: self.broadcast_tx.clone(),
             config: self.config.clone(),
         });
 
-        let compact_self = Arc::new(SqliteBackend {
-            pool: self.pool.clone(),
-            current_rev: AtomicI64::new(0),
-            notify: Notify::new(),
-            broadcast_tx: self.broadcast_tx.clone(),
-            config: self.config.clone(),
-        });
-
-        let ttl_self = Arc::new(SqliteBackend {
-            pool: self.pool.clone(),
-            current_rev: AtomicI64::new(0),
-            notify: Notify::new(),
-            broadcast_tx: self.broadcast_tx.clone(),
-            config: self.config.clone(),
-        });
+        let poll_self = shared.clone();
+        let compact_self = shared.clone();
+        let ttl_self = shared;
 
         tokio::spawn(async move { poll_self.poll_loop().await });
         tokio::spawn(async move { compact_self.compact_loop().await });
@@ -936,7 +923,12 @@ impl Backend for SqliteBackend {
             .map(|e| e.kv.mod_revision)
             .unwrap_or(0);
 
-        self.insert(key, true, false, 0, prev_revision, lease, value, b"")
+        let old_value = existing
+            .as_ref()
+            .map(|e| e.kv.value.as_slice())
+            .unwrap_or(b"");
+
+        self.insert(key, true, false, 0, prev_revision, lease, value, old_value)
             .await
     }
 
@@ -991,16 +983,32 @@ impl Backend for SqliteBackend {
         revision: i64,
         keys_only: bool,
     ) -> Result<(i64, Vec<KeyValue>)> {
-        // Build the LIKE pattern: append % for prefix matching
-        let like_prefix = if prefix.ends_with('/') {
-            format!("{}%", prefix.replace('_', "^_"))
+        // Match kine's prefix/startKey handling:
+        // - If prefix ends with '/' and startKey == prefix, clear startKey
+        // - If prefix doesn't end with '/', clear startKey entirely
+        let (like_prefix, effective_start) = if prefix.ends_with('/') {
+            let sk = if start_key == prefix { "" } else { start_key };
+            (format!("{}%", prefix.replace('_', "^_")), sk)
         } else {
-            prefix.replace('_', "^_")
+            (prefix.replace('_', "^_"), "")
         };
 
         let (rev, events) = self
-            .list_internal(&like_prefix, start_key, limit, revision, false, keys_only)
+            .list_internal(&like_prefix, effective_start, limit, revision, false, keys_only)
             .await?;
+
+        // Match kine's relist behavior: if revision=0 and result is empty,
+        // retry at the current revision to handle create/list race
+        if revision == 0 && events.is_empty() {
+            let current = self.cached_revision().await?;
+            if current > 0 {
+                let (rev2, events2) = self
+                    .list_internal(&like_prefix, effective_start, limit, current, false, keys_only)
+                    .await?;
+                let kvs = events2.into_iter().map(|e| e.kv).collect();
+                return Ok((rev2, kvs));
+            }
+        }
 
         let kvs = events.into_iter().map(|e| e.kv).collect();
         Ok((rev, kvs))

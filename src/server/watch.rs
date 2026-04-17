@@ -54,8 +54,27 @@ impl<B: Backend> Watch for KvBridge<B> {
                 match req.request_union {
                     Some(watch_request::RequestUnion::CreateRequest(create)) => {
                         let watch_id = WATCH_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-                        let key = String::from_utf8_lossy(&create.key).to_string();
+                        let raw_key = String::from_utf8_lossy(&create.key).to_string();
+                        // Redirect compact_rev_key to internal key
+                        let key = if raw_key == "compact_rev_key" {
+                            "compact_rev_key_apiserver".to_string()
+                        } else {
+                            raw_key
+                        };
                         let start_revision = create.start_revision;
+
+                        // Reject negative start revision (kine sends ErrCompacted)
+                        if start_revision < 0 {
+                            let _ = resp_tx.send(Ok(WatchResponse {
+                                header: Some(ResponseHeader::default()),
+                                watch_id,
+                                canceled: true,
+                                compact_revision: start_revision,
+                                cancel_reason: "compacted".to_string(),
+                                ..Default::default()
+                            })).await;
+                            continue;
+                        }
 
                         // Send created confirmation
                         let _ = resp_tx.send(Ok(WatchResponse {
