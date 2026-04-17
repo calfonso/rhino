@@ -808,8 +808,7 @@ impl SqliteBackend {
             .await
             .map_err(|e| BackendError::Internal(e.to_string()))?;
 
-            // Clean up kine_current: remove entries pointing to deleted keys
-            // whose tombstone rows were just compacted away
+            // Clean up kine_current: remove entries whose kine rows were deleted
             let cleaned = sqlx::query(
                 "DELETE FROM kine_current WHERE name IN (
                     SELECT cur.name FROM kine_current AS cur
@@ -925,7 +924,7 @@ impl Backend for SqliteBackend {
 
     async fn create(&self, key: &str, value: &[u8], lease: i64) -> Result<i64> {
         // Check if key exists (including deleted — so we can get prev_revision)
-        let (rev, existing) = self.get_internal(key, 0, true, false).await?;
+        let (_rev, existing) = self.get_internal(key, 0, true, false).await?;
 
         if let Some(ref event) = existing
             && !event.delete {
@@ -935,7 +934,7 @@ impl Backend for SqliteBackend {
         let prev_revision = existing
             .as_ref()
             .map(|e| e.kv.mod_revision)
-            .unwrap_or(rev);
+            .unwrap_or(0);
 
         self.insert(key, true, false, 0, prev_revision, lease, value, b"")
             .await
@@ -1261,7 +1260,7 @@ impl Backend for SqliteBackend {
         .await
         .map_err(|e| BackendError::Internal(e.to_string()))?;
 
-        // Clean up kine_current: remove entries pointing to deleted rows
+        // Clean up kine_current: remove entries whose kine rows were deleted
         sqlx::query(
             "DELETE FROM kine_current WHERE name IN (
                 SELECT cur.name FROM kine_current AS cur

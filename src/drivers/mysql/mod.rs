@@ -722,7 +722,7 @@ impl Backend for MysqlBackend {
     }
 
     async fn create(&self, key: &str, value: &[u8], lease: i64) -> Result<i64> {
-        let (rev, existing) = self.get_internal(key, 0, true, false).await?;
+        let (_rev, existing) = self.get_internal(key, 0, true, false).await?;
 
         if let Some(ref event) = existing
             && !event.delete
@@ -733,7 +733,7 @@ impl Backend for MysqlBackend {
         let prev_revision = existing
             .as_ref()
             .map(|e| e.kv.mod_revision)
-            .unwrap_or(rev);
+            .unwrap_or(0);
 
         self.insert(key, true, false, 0, prev_revision, lease, value, b"")
             .await
