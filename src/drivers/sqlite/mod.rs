@@ -110,6 +110,10 @@ impl SqliteBackend {
                 value BLOB,
                 old_value BLOB
             )",
+            "CREATE TABLE IF NOT EXISTS kine_current (
+                name TEXT PRIMARY KEY,
+                id INTEGER NOT NULL
+            )",
             "CREATE INDEX IF NOT EXISTS kine_name_index ON kine (name)",
             "CREATE INDEX IF NOT EXISTS kine_name_id_index ON kine (name, id)",
             "CREATE INDEX IF NOT EXISTS kine_id_deleted_index ON kine (id, deleted)",
@@ -123,6 +127,15 @@ impl SqliteBackend {
                 .await
                 .map_err(|e| BackendError::Internal(format!("schema setup failed: {e}")))?;
         }
+
+        // Populate kine_current from existing data (migration for existing databases)
+        sqlx::query(
+            "INSERT OR REPLACE INTO kine_current (name, id)
+             SELECT name, MAX(id) FROM kine GROUP BY name",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| BackendError::Internal(format!("kine_current migration failed: {e}")))?;
 
         debug!("database schema and indexes are up to date");
         Ok(())
@@ -183,6 +196,18 @@ impl SqliteBackend {
         })?;
 
         let id = result.last_insert_rowid();
+
+        // Update kine_current to point to this latest revision
+        sqlx::query(
+            "INSERT INTO kine_current (name, id) VALUES (?, ?)
+             ON CONFLICT(name) DO UPDATE SET id = excluded.id",
+        )
+        .bind(key)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| BackendError::Internal(format!("kine_current update failed: {e}")))?;
+
         self.current_rev.store(id, Ordering::Release);
         self.notify.notify_waiters();
         Ok(id)
@@ -240,7 +265,8 @@ impl SqliteBackend {
     }
 
     /// Core list query. Returns (current_revision, events).
-    /// This implements the same query structure as kine's generic List/ListCurrent.
+    /// For current-revision queries (revision == 0), uses kine_current for O(keys) lookup.
+    /// For historical queries (revision > 0), falls back to MAX(id) GROUP BY subquery.
     async fn list_internal(
         &self,
         prefix: &str,
@@ -256,70 +282,107 @@ impl SqliteBackend {
             ", kv.value, kv.old_value"
         };
 
-        let (extra_where, query) = if revision == 0 {
-            // ListCurrent: no revision bound
-            if start_key.is_empty() {
-                (String::new(), None)
-            } else {
-                ("AND mkv.name >= ?".to_string(), Some(start_key.to_string()))
-            }
-        } else if start_key.is_empty() {
-            // List at specific revision
-            (format!("AND mkv.id <= {revision}"), None)
-        } else {
-            // List at specific revision with start key
-            (
-                format!("AND mkv.name >= ? AND mkv.id <= {revision}"),
-                Some(start_key.to_string()),
-            )
-        };
-
         let limit_clause = if limit > 0 {
             format!("LIMIT {limit}")
         } else {
             String::new()
         };
 
-        let sql = format!(
-            "SELECT
-                (SELECT MAX(rkv.id) FROM kine AS rkv),
-                (SELECT MAX(crkv.prev_revision) FROM kine AS crkv WHERE crkv.name = '{COMPACT_REV_KEY}'),
-                kv.id AS theid,
-                kv.name AS thename,
-                kv.created,
-                kv.deleted,
-                kv.create_revision,
-                kv.prev_revision,
-                kv.lease
-                {value_cols}
-            FROM kine AS kv
-            JOIN (
-                SELECT MAX(mkv.id) AS id
-                FROM kine AS mkv
-                WHERE mkv.name LIKE ? ESCAPE '^'
-                {extra_where}
-                GROUP BY mkv.name
-            ) AS maxkv ON maxkv.id = kv.id
-            WHERE (kv.deleted = 0 OR ?)
-            ORDER BY kv.name ASC
-            {limit_clause}"
-        );
-
         let include_deleted_val: i32 = if include_deleted { 1 } else { 0 };
 
-        let rows = if let Some(ref sk) = query {
-            sqlx::query(&sql)
-                .bind(prefix)
-                .bind(sk)
-                .bind(include_deleted_val)
-                .fetch_all(&self.pool)
-                .await
+        let rows = if revision == 0 {
+            // Current-revision query: use kine_current table (O(matching_keys))
+            let start_where = if start_key.is_empty() {
+                String::new()
+            } else {
+                "AND cur.name >= ?".to_string()
+            };
+
+            let sql = format!(
+                "SELECT
+                    (SELECT MAX(rkv.id) FROM kine AS rkv),
+                    (SELECT MAX(crkv.prev_revision) FROM kine AS crkv WHERE crkv.name = '{COMPACT_REV_KEY}'),
+                    kv.id AS theid,
+                    kv.name AS thename,
+                    kv.created,
+                    kv.deleted,
+                    kv.create_revision,
+                    kv.prev_revision,
+                    kv.lease
+                    {value_cols}
+                FROM kine AS kv
+                JOIN kine_current AS cur ON cur.id = kv.id
+                WHERE cur.name LIKE ? ESCAPE '^'
+                {start_where}
+                AND (kv.deleted = 0 OR ?)
+                ORDER BY kv.name ASC
+                {limit_clause}"
+            );
+
+            if start_key.is_empty() {
+                sqlx::query(&sql)
+                    .bind(prefix)
+                    .bind(include_deleted_val)
+                    .fetch_all(&self.pool)
+                    .await
+            } else {
+                sqlx::query(&sql)
+                    .bind(prefix)
+                    .bind(start_key)
+                    .bind(include_deleted_val)
+                    .fetch_all(&self.pool)
+                    .await
+            }
         } else {
-            sqlx::query(&sql)
-                .bind(prefix)
-                .bind(include_deleted_val)
-                .fetch_all(&self.pool)
-                .await
+            // Historical query: must scan revisions up to the requested revision
+            let (extra_where, query) = if start_key.is_empty() {
+                (format!("AND mkv.id <= {revision}"), None)
+            } else {
+                (
+                    format!("AND mkv.name >= ? AND mkv.id <= {revision}"),
+                    Some(start_key.to_string()),
+                )
+            };
+
+            let sql = format!(
+                "SELECT
+                    (SELECT MAX(rkv.id) FROM kine AS rkv),
+                    (SELECT MAX(crkv.prev_revision) FROM kine AS crkv WHERE crkv.name = '{COMPACT_REV_KEY}'),
+                    kv.id AS theid,
+                    kv.name AS thename,
+                    kv.created,
+                    kv.deleted,
+                    kv.create_revision,
+                    kv.prev_revision,
+                    kv.lease
+                    {value_cols}
+                FROM kine AS kv
+                JOIN (
+                    SELECT MAX(mkv.id) AS id
+                    FROM kine AS mkv
+                    WHERE mkv.name LIKE ? ESCAPE '^'
+                    {extra_where}
+                    GROUP BY mkv.name
+                ) AS maxkv ON maxkv.id = kv.id
+                WHERE (kv.deleted = 0 OR ?)
+                ORDER BY kv.name ASC
+                {limit_clause}"
+            );
+
+            if let Some(ref sk) = query {
+                sqlx::query(&sql)
+                    .bind(prefix)
+                    .bind(sk)
+                    .bind(include_deleted_val)
+                    .fetch_all(&self.pool)
+                    .await
+            } else {
+                sqlx::query(&sql)
+                    .bind(prefix)
+                    .bind(include_deleted_val)
+                    .fetch_all(&self.pool)
+                    .await
+            }
         }
         .map_err(|e| BackendError::Internal(e.to_string()))?;
 
