@@ -20,6 +20,10 @@ struct Args {
     /// Compaction interval in seconds (0 to disable)
     #[arg(long, default_value = "300")]
     compact_interval: u64,
+
+    /// Maximum database connection pool size
+    #[arg(long, default_value = "10")]
+    max_connections: u32,
 }
 
 #[tokio::main]
@@ -38,6 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let config = PostgresConfig {
             dsn: args.endpoint,
             compact_interval,
+            max_connections: args.max_connections,
             ..Default::default()
         };
         let backend = PostgresBackend::new(config).await?;
@@ -46,6 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let config = MysqlConfig {
             dsn: args.endpoint,
             compact_interval,
+            max_connections: args.max_connections,
             ..Default::default()
         };
         let backend = MysqlBackend::new(config).await?;
@@ -54,6 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let config = SqliteConfig {
             dsn: args.endpoint,
             compact_interval,
+            max_connections: args.max_connections,
             ..Default::default()
         };
         let backend = SqliteBackend::new(config).await?;

@@ -34,6 +34,8 @@ pub struct SqliteConfig {
     pub compact_min_retain: i64,
     /// Max revisions to compact per transaction batch.
     pub compact_batch_size: i64,
+    /// Maximum number of connections in the pool. Defaults to 20.
+    pub max_connections: u32,
 }
 
 impl Default for SqliteConfig {
@@ -43,6 +45,7 @@ impl Default for SqliteConfig {
             compact_interval: COMPACT_INTERVAL,
             compact_min_retain: COMPACT_MIN_RETAIN,
             compact_batch_size: COMPACT_BATCH_SIZE,
+            max_connections: 10,
         }
     }
 }
@@ -78,7 +81,7 @@ impl SqliteBackend {
             .pragma("cache_size", "-2000");
 
         let pool = SqlitePoolOptions::new()
-            .max_connections(5)
+            .max_connections(config.max_connections)
             .connect_with(opts)
             .await
             .map_err(|e| BackendError::Internal(format!("failed to open database: {e}")))?;

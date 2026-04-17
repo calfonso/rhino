@@ -414,6 +414,7 @@ async fn test_compact_removes_old_rows() {
         compact_interval: Duration::ZERO,
         compact_min_retain: 5,
         compact_batch_size: 100,
+        ..Default::default()
     };
     let backend = SqliteBackend::new(config).await.unwrap();
     backend.start().await.unwrap();
