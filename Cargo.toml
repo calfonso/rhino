@@ -1,0 +1,24 @@
+[package]
+name = "rhino"
+version = "0.1.0"
+edition = "2024"
+description = "An etcd API shim that translates the etcd v3 gRPC API to relational database backends"
+license = "Apache-2.0"
+
+[dependencies]
+async-stream = "0.3"
+async-trait = "0.1"
+futures-core = "0.3"
+prost = "0.13"
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "postgres", "mysql"] }
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tonic = "0.12"
+tracing = "0.1"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[build-dependencies]
+tonic-build = "0.12"
