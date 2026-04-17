@@ -226,7 +226,7 @@ impl<B: Backend> KvBridge<B> {
     ) -> Result<RangeResponse, Status> {
         let range_end = &r.range_end;
         let prefix = {
-            let mut p = range_end[..range_end.len() - 1].to_vec();
+            let mut p = range_end.clone();
             if let Some(last) = p.last_mut() {
                 *last = last.wrapping_sub(1);
             }
