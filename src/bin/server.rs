@@ -1,17 +1,21 @@
 use clap::Parser;
-use rhino::{RhinoServer, SqliteBackend, SqliteConfig};
+use rhino::{
+    MysqlBackend, MysqlConfig, PostgresBackend, PostgresConfig, RhinoServer, SqliteBackend,
+    SqliteConfig,
+};
 use std::time::Duration;
 
 #[derive(Parser)]
-#[command(name = "rhino-server", about = "etcd-compatible gRPC server backed by SQLite")]
+#[command(name = "rhino-server", about = "etcd-compatible gRPC server backed by SQL")]
 struct Args {
     /// gRPC listen address
     #[arg(long, default_value = "0.0.0.0:2379")]
     listen_address: String,
 
-    /// Path to the SQLite database file
+    /// Storage endpoint. Use a file path for SQLite (default),
+    /// postgres:// for PostgreSQL, or mysql:// for MySQL.
     #[arg(long, default_value = "./db/state.db")]
-    db_path: String,
+    endpoint: String,
 
     /// Compaction interval in seconds (0 to disable)
     #[arg(long, default_value = "300")]
@@ -28,15 +32,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = Args::parse();
+    let compact_interval = Duration::from_secs(args.compact_interval);
 
-    let config = SqliteConfig {
-        dsn: args.db_path,
-        compact_interval: Duration::from_secs(args.compact_interval),
-        ..Default::default()
-    };
-
-    let backend = SqliteBackend::new(config).await?;
-    let server = RhinoServer::new(backend);
-
-    server.serve(&args.listen_address).await
+    if args.endpoint.starts_with("postgres://") || args.endpoint.starts_with("postgresql://") {
+        let config = PostgresConfig {
+            dsn: args.endpoint,
+            compact_interval,
+            ..Default::default()
+        };
+        let backend = PostgresBackend::new(config).await?;
+        RhinoServer::new(backend).serve(&args.listen_address).await
+    } else if args.endpoint.starts_with("mysql://") || args.endpoint.starts_with("mariadb://") {
+        let config = MysqlConfig {
+            dsn: args.endpoint,
+            compact_interval,
+            ..Default::default()
+        };
+        let backend = MysqlBackend::new(config).await?;
+        RhinoServer::new(backend).serve(&args.listen_address).await
+    } else {
+        let config = SqliteConfig {
+            dsn: args.endpoint,
+            compact_interval,
+            ..Default::default()
+        };
+        let backend = SqliteBackend::new(config).await?;
+        RhinoServer::new(backend).serve(&args.listen_address).await
+    }
 }

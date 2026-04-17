@@ -26,8 +26,8 @@ Rhino eliminates it. Your etcd clients connect to Rhino exactly as they would to
 | Backend    | Status  |
 |------------|---------|
 | SQLite     | Ready   |
-| PostgreSQL | Planned |
-| MySQL      | Planned |
+| PostgreSQL | Ready   |
+| MySQL      | Ready   |
 
 ## Quickstart
 
@@ -39,28 +39,92 @@ Add Rhino to your project:
 cargo add rhino
 ```
 
-Embed and run:
+Embed with SQLite:
 
 ```rust
 use rhino::{RhinoServer, SqliteBackend, SqliteConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = SqliteConfig {
-        dsn: "./db/state.db".to_string(),
-        ..Default::default()
-    };
-
-    let backend = SqliteBackend::new(config).await?;
+    let backend = SqliteBackend::new(SqliteConfig::default()).await?;
     let server = RhinoServer::new(backend);
     server.serve("0.0.0.0:2379").await?;
     Ok(())
 }
 ```
 
+Or with PostgreSQL:
+
+```rust
+use rhino::{RhinoServer, PostgresBackend, PostgresConfig};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = PostgresConfig {
+        dsn: "postgres://user:pass@localhost/kubernetes".to_string(),
+        ..Default::default()
+    };
+
+    let backend = PostgresBackend::new(config).await?;
+    let server = RhinoServer::new(backend);
+    server.serve("0.0.0.0:2379").await?;
+    Ok(())
+}
+```
+
+### As a standalone server
+
+Build and run the included binary:
+
+```sh
+cargo run --bin rhino-server
+```
+
+The `--endpoint` flag selects the backend automatically:
+
+```sh
+# SQLite (default)
+cargo run --bin rhino-server -- --endpoint ./db/state.db
+
+# PostgreSQL
+cargo run --bin rhino-server -- --endpoint postgres://user:pass@localhost/kubernetes
+
+# MySQL
+cargo run --bin rhino-server -- --endpoint mysql://root:root@localhost/kubernetes
+```
+
+Options:
+
+```
+--listen-address <ADDR>      gRPC listen address [default: 0.0.0.0:2379]
+--endpoint <ENDPOINT>        File path for SQLite, postgres:// for PostgreSQL, mysql:// for MySQL [default: ./db/state.db]
+--compact-interval <SECS>    Compaction interval in seconds, 0 to disable [default: 300]
+```
+
+Control log verbosity with `RUST_LOG`:
+
+```sh
+RUST_LOG=debug cargo run --bin rhino-server
+```
+
+### With Docker
+
+```sh
+docker build -t rhino .
+docker run -p 2379:2379 -v rhino-data:/data rhino
+```
+
+The container stores its database at `/data/db/state.db`. Mount a volume to persist across restarts.
+
+Override defaults with arguments:
+
+```sh
+docker run -p 2379:2379 rhino --listen-address 0.0.0.0:2379 --compact-interval 60
+```
+
 ### With etcdctl
 
-Once the server is running, any standard etcd client works:
+Once the server is running (via any method above), any standard etcd client works:
 
 ```sh
 # Put a key
@@ -78,7 +142,7 @@ etcdctl watch /myapp/ --prefix
 
 ## Configuration
 
-`SqliteConfig` controls the SQLite backend:
+### SqliteConfig
 
 | Field                | Type       | Default          | Description                            |
 |----------------------|------------|------------------|----------------------------------------|
@@ -87,12 +151,33 @@ etcdctl watch /myapp/ --prefix
 | `compact_min_retain` | `i64`      | 1000             | Minimum revisions to keep              |
 | `compact_batch_size` | `i64`      | 1000             | Rows processed per compaction batch    |
 
-Set `compact_interval` to `Duration::ZERO` to disable automatic compaction.
+### PostgresConfig
+
+| Field                | Type       | Default                                          | Description                            |
+|----------------------|------------|--------------------------------------------------|----------------------------------------|
+| `dsn`                | `String`   | `postgres://postgres:postgres@localhost/kubernetes` | PostgreSQL connection string           |
+| `compact_interval`   | `Duration` | 300 seconds                                      | How often to run background compaction |
+| `compact_min_retain` | `i64`      | 1000                                             | Minimum revisions to keep              |
+| `compact_batch_size` | `i64`      | 1000                                             | Rows processed per compaction batch    |
+| `max_connections`    | `u32`      | 5                                                | Maximum connections in the pool        |
+
+### MysqlConfig
+
+| Field                | Type       | Default                              | Description                            |
+|----------------------|------------|--------------------------------------|----------------------------------------|
+| `dsn`                | `String`   | `mysql://root@localhost/kubernetes`   | MySQL connection string                |
+| `compact_interval`   | `Duration` | 300 seconds                          | How often to run background compaction |
+| `compact_min_retain` | `i64`      | 1000                                 | Minimum revisions to keep              |
+| `compact_batch_size` | `i64`      | 1000                                 | Rows processed per compaction batch    |
+| `max_connections`    | `u32`      | 5                                    | Maximum connections in the pool        |
+
+Set `compact_interval` to `Duration::ZERO` to disable automatic compaction on any backend.
 
 ## Documentation
 
 - **[Getting Started](docs/GETTING_STARTED.md)** — installation, first steps, and common usage patterns
 - **[Architecture](docs/ARCHITECTURE.md)** — system design, data model, and how the pieces fit together
+- **[Testing](docs/TESTING.md)** — how to run tests, write new ones, and smoke-test with `etcdctl`
 
 ## Running Tests
 
@@ -100,7 +185,13 @@ Set `compact_interval` to `Duration::ZERO` to disable automatic compaction.
 cargo test
 ```
 
-Tests use temporary in-memory SQLite databases and cover create, read, update, delete, list, count, watch, revision ordering, compaction, and error handling.
+This runs the 16 SQLite backend tests using temporary databases — no external services needed. To also run the PostgreSQL tests, provide a connection string:
+
+```sh
+RHINO_POSTGRES_DSN="postgres://postgres:postgres@localhost/rhino_test" cargo test
+```
+
+See **[docs/TESTING.md](docs/TESTING.md)** for the full testing guide: prerequisites, test inventory, how to write new tests, and smoke-testing with `etcdctl`.
 
 ## License
 

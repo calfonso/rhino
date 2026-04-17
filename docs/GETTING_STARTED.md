@@ -4,7 +4,7 @@ This guide walks you through installing Rhino, running your first server, and co
 
 ## Prerequisites
 
-- **Rust 1.85+** (2024 edition)
+- **Rust 1.80+** (stable, 2024 edition)
 - **protoc** (Protocol Buffers compiler) — required to build the gRPC stubs
   ```sh
   # macOS
@@ -30,39 +30,128 @@ cargo add rhino
 ### From source
 
 ```sh
-git clone https://github.com/chrisalfonso/rhino.git
+git clone https://github.com/calfonso/rhino.git
 cd rhino
 cargo build --release
 ```
 
+The server binary will be at `target/release/rhino-server`.
+
 ## Running the Server
 
-### Embed in your application
+### Standalone binary
+
+The simplest way to start is with the included binary:
+
+```sh
+cargo run --bin rhino-server
+```
+
+This starts a gRPC server on `0.0.0.0:2379` with a SQLite database at `./db/state.db`.
+
+### Choosing a backend
+
+The `--endpoint` flag auto-detects the backend from the URL scheme:
+
+```sh
+# SQLite (default — any file path)
+rhino-server --endpoint ./db/state.db
+
+# PostgreSQL
+rhino-server --endpoint postgres://user:pass@localhost/kubernetes
+
+# MySQL
+rhino-server --endpoint mysql://root:root@localhost/kubernetes
+```
+
+All flags:
+
+```
+--listen-address <ADDR>      gRPC listen address [default: 0.0.0.0:2379]
+--endpoint <ENDPOINT>        Storage endpoint [default: ./db/state.db]
+--compact-interval <SECS>    Compaction interval, 0 to disable [default: 300]
+```
+
+### With Docker
+
+```sh
+docker build -t rhino .
+docker run -p 2379:2379 -v rhino-data:/data rhino
+```
+
+The container stores its database at `/data/db/state.db`. Override with arguments:
+
+```sh
+# Use Postgres instead
+docker run -p 2379:2379 rhino \
+  --endpoint postgres://user:pass@db-host/kubernetes
+```
+
+### Logging
+
+Control verbosity with `RUST_LOG`:
+
+```sh
+RUST_LOG=info  rhino-server          # default
+RUST_LOG=debug rhino-server          # connection and query details
+RUST_LOG=rhino=trace rhino-server    # everything including poll loop events
+```
+
+## Embed as a library
+
+### SQLite
 
 ```rust
 use rhino::{RhinoServer, SqliteBackend, SqliteConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = SqliteConfig {
-        dsn: "./db/state.db".to_string(),
-        ..Default::default()
-    };
-
-    let backend = SqliteBackend::new(config).await?;
+    let backend = SqliteBackend::new(SqliteConfig::default()).await?;
     let server = RhinoServer::new(backend);
     server.serve("0.0.0.0:2379").await?;
     Ok(())
 }
 ```
 
-Rhino will:
-1. Create the database file and parent directories if they don't exist
-2. Initialize the schema (table and indexes)
-3. Start background compaction and watch poll loops
-4. Begin accepting gRPC connections on port 2379
+Rhino will create the database file and parent directories if they don't exist.
+
+### PostgreSQL
+
+```rust
+use rhino::{RhinoServer, PostgresBackend, PostgresConfig};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = PostgresConfig {
+        dsn: "postgres://user:pass@localhost/kubernetes".to_string(),
+        ..Default::default()
+    };
+    let backend = PostgresBackend::new(config).await?;
+    RhinoServer::new(backend).serve("0.0.0.0:2379").await
+}
+```
+
+The database must already exist. Rhino creates the `kine` table and indexes automatically.
+
+### MySQL
+
+```rust
+use rhino::{RhinoServer, MysqlBackend, MysqlConfig};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = MysqlConfig {
+        dsn: "mysql://root:root@localhost/kubernetes".to_string(),
+        ..Default::default()
+    };
+    let backend = MysqlBackend::new(config).await?;
+    RhinoServer::new(backend).serve("0.0.0.0:2379").await
+}
+```
 
 ### Custom configuration
+
+All backends share the same compaction knobs:
 
 ```rust
 use std::time::Duration;
@@ -76,125 +165,104 @@ let config = SqliteConfig {
 };
 
 let backend = SqliteBackend::new(config).await?;
-let server = RhinoServer::new(backend);
-server.serve("0.0.0.0:2379").await?;
+RhinoServer::new(backend).serve("0.0.0.0:2379").await?;
 ```
 
-To disable automatic compaction entirely, set `compact_interval` to `Duration::ZERO`.
+Set `compact_interval` to `Duration::ZERO` to disable automatic compaction entirely.
 
-## Using with etcd Clients
+## Using with etcd clients
 
-Once Rhino is running, any etcd v3 client can connect to it. Here are common operations using `etcdctl`:
+Once Rhino is running, any etcd v3 client can connect to it.
 
-### Write and read
+### etcdctl
 
 ```sh
 # Set the endpoint
 export ETCDCTL_ENDPOINTS=http://localhost:2379
 
-# Create a key
+# Write
 etcdctl put /app/config/db_host "postgres.internal"
 
-# Read it back
+# Read
 etcdctl get /app/config/db_host
-```
 
-### List by prefix
-
-```sh
-# Create a few keys
-etcdctl put /app/config/db_host "postgres.internal"
+# List by prefix
 etcdctl put /app/config/db_port "5432"
 etcdctl put /app/config/cache_ttl "300"
-
-# List all config keys
 etcdctl get /app/config/ --prefix
-```
 
-### Watch for changes
-
-In one terminal, start a watch:
-
-```sh
+# Watch for changes (blocks and streams)
 etcdctl watch /app/config/ --prefix
-```
 
-In another terminal, make a change:
-
-```sh
-etcdctl put /app/config/db_host "postgres-2.internal"
-```
-
-The watch terminal will show the update in real time.
-
-### Delete a key
-
-```sh
+# Delete
 etcdctl del /app/config/cache_ttl
 ```
 
-## Implementing a Custom Backend
+### Go client
 
-Rhino's `Backend` trait lets you plug in any storage engine. Implement these methods:
+```go
+cli, _ := clientv3.New(clientv3.Config{
+    Endpoints: []string{"localhost:2379"},
+})
+defer cli.Close()
+
+cli.Put(ctx, "/mykey", "myvalue")
+resp, _ := cli.Get(ctx, "/mykey")
+```
+
+### Rust client (etcd-client crate)
 
 ```rust
-use rhino::backend::{Backend, BackendError, KeyValue, Event, WatchResult};
+let mut client = etcd_client::Client::connect(["localhost:2379"], None).await?;
+client.put("/mykey", "myvalue", None).await?;
+let resp = client.get("/mykey", None).await?;
+```
+
+## Implementing a custom backend
+
+Rhino's `Backend` trait lets you plug in any storage engine:
+
+```rust
+use rhino::backend::{Backend, BackendError, KeyValue, WatchResult};
 use async_trait::async_trait;
 
 pub struct MyBackend { /* ... */ }
 
 #[async_trait]
 impl Backend for MyBackend {
-    async fn start(&self) -> Result<(), BackendError> { /* ... */ }
+    async fn start(&self) -> Result<(), BackendError> { todo!() }
     async fn get(&self, key: &str, range_end: &str, limit: i64,
                  revision: i64, keys_only: bool)
-        -> Result<(i64, Option<KeyValue>), BackendError> { /* ... */ }
+        -> Result<(i64, Option<KeyValue>), BackendError> { todo!() }
     async fn create(&self, key: &str, value: &[u8], lease: i64)
-        -> Result<i64, BackendError> { /* ... */ }
+        -> Result<i64, BackendError> { todo!() }
     async fn delete(&self, key: &str, revision: i64)
-        -> Result<(i64, Option<KeyValue>, bool), BackendError> { /* ... */ }
+        -> Result<(i64, Option<KeyValue>, bool), BackendError> { todo!() }
     async fn list(&self, prefix: &str, start_key: &str, limit: i64,
                   revision: i64, keys_only: bool)
-        -> Result<(i64, Vec<KeyValue>), BackendError> { /* ... */ }
+        -> Result<(i64, Vec<KeyValue>), BackendError> { todo!() }
     async fn count(&self, prefix: &str, start_key: &str, revision: i64)
-        -> Result<(i64, i64), BackendError> { /* ... */ }
+        -> Result<(i64, i64), BackendError> { todo!() }
     async fn update(&self, key: &str, value: &[u8], revision: i64, lease: i64)
-        -> Result<(i64, Option<KeyValue>, bool), BackendError> { /* ... */ }
+        -> Result<(i64, Option<KeyValue>, bool), BackendError> { todo!() }
     async fn watch(&self, key: &str, revision: i64)
-        -> Result<WatchResult, BackendError> { /* ... */ }
-    async fn db_size(&self) -> Result<i64, BackendError> { /* ... */ }
-    async fn current_revision(&self) -> Result<i64, BackendError> { /* ... */ }
-    async fn compact(&self, revision: i64) -> Result<i64, BackendError> { /* ... */ }
+        -> Result<WatchResult, BackendError> { todo!() }
+    async fn db_size(&self) -> Result<i64, BackendError> { todo!() }
+    async fn current_revision(&self) -> Result<i64, BackendError> { todo!() }
+    async fn compact(&self, revision: i64)
+        -> Result<i64, BackendError> { todo!() }
 }
 ```
 
 Then pass it to `RhinoServer`:
 
 ```rust
-let backend = MyBackend::new(/* ... */);
-let server = RhinoServer::new(backend);
+let server = RhinoServer::new(MyBackend::new());
 server.serve("0.0.0.0:2379").await?;
 ```
 
-## Running Tests
-
-```sh
-cargo test
-```
-
-Tests create temporary SQLite databases in isolated temp directories and cover:
-
-- Create, get, update, delete operations
-- Duplicate key prevention
-- Revision ordering and consistency
-- Prefix listing with pagination
-- Key counting
-- Watch event streaming
-- Compaction
-- Database size reporting
-
-## Next Steps
+## Next steps
 
 - Read the [Architecture](ARCHITECTURE.md) doc to understand the data model and internals
-- Browse the [source](src/) to see the Backend trait and SQLite implementation
-- Check [issues](https://github.com/chrisalfonso/rhino/issues) for planned work and contribution opportunities
+- Read the [Testing](TESTING.md) doc for how to run and write tests
+- Check [issues](https://github.com/calfonso/rhino/issues) for planned work
