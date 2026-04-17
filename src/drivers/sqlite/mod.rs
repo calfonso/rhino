@@ -79,7 +79,8 @@ impl SqliteBackend {
             .synchronous(SqliteSynchronous::Full)
             .busy_timeout(Duration::from_secs(30))
             .pragma("cache_size", "-2000")
-            .pragma("auto_vacuum", "incremental");
+            .pragma("auto_vacuum", "incremental")
+            .pragma("txlock", "immediate");
 
         // Run startup VACUUM on a single connection before creating the pool.
         // VACUUM requires exclusive access and can't run with pooled connections.
@@ -155,6 +156,7 @@ impl SqliteBackend {
     }
 
     async fn ensure_compact_rev_key(&self) -> Result<()> {
+        // Count compact_rev_key entries
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM kine WHERE name = ?")
             .bind(COMPACT_REV_KEY)
             .fetch_one(&self.pool)
@@ -164,6 +166,20 @@ impl SqliteBackend {
         if count.0 == 0 {
             self.insert(COMPACT_REV_KEY, true, false, 0, 0, 0, b"", b"")
                 .await?;
+        } else if count.0 > 1 {
+            // Clean up duplicate compact_rev_key rows (matching kine's compactStart).
+            // Keep only the one with the highest prev_revision.
+            sqlx::query(
+                "DELETE FROM kine WHERE name = ? AND id NOT IN (
+                    SELECT id FROM kine WHERE name = ? ORDER BY prev_revision DESC LIMIT 1
+                )",
+            )
+            .bind(COMPACT_REV_KEY)
+            .bind(COMPACT_REV_KEY)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| BackendError::Internal(e.to_string()))?;
+            debug!("cleaned up duplicate compact_rev_key rows");
         }
         Ok(())
     }
@@ -610,10 +626,10 @@ impl SqliteBackend {
                         );
                     } else if skip != next {
                         // First time seeing gap — record and retry
+                        // (kine's FillRetryDuration is 0 for SQLite — no sleep)
                         skip = next;
                         skip_time = tokio::time::Instant::now();
                         self.notify.notify_waiters();
-                        tokio::time::sleep(Duration::from_millis(100)).await;
                         break;
                     } else {
                         // Second attempt — fill the gap
@@ -749,7 +765,22 @@ impl SqliteBackend {
             return;
         }
 
-        let mut interval = tokio::time::interval(self.config.compact_interval);
+        // Apply jitter (5% of interval, matching kine's default)
+        let jitter_range = self.config.compact_interval.as_millis() as i64 / 20;
+        let jitter = if jitter_range > 0 {
+            let jitter_ms = (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64)
+                % (jitter_range * 2)
+                - jitter_range;
+            Duration::from_millis(jitter_ms.unsigned_abs())
+        } else {
+            Duration::ZERO
+        };
+        let interval_with_jitter = self.config.compact_interval + jitter;
+
+        let mut interval = tokio::time::interval(interval_with_jitter);
         interval.tick().await; // skip the first immediate tick
 
         loop {
@@ -788,6 +819,17 @@ impl SqliteBackend {
                 .begin()
                 .await
                 .map_err(|e| BackendError::Internal(e.to_string()))?;
+
+            // Verify compact_rev hasn't changed (another compactor may have run)
+            let db_compact: (Option<i64>,) =
+                sqlx::query_as("SELECT MAX(prev_revision) FROM kine WHERE name = ?")
+                    .bind(COMPACT_REV_KEY)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|e| BackendError::Internal(e.to_string()))?;
+            if db_compact.0.unwrap_or(0) != compact_rev {
+                return Err(BackendError::Compacted);
+            }
 
             // Delete superseded revisions and deleted entries up to iter_rev
             let deleted = sqlx::query(
@@ -1021,12 +1063,96 @@ impl Backend for SqliteBackend {
             prefix.replace('_', "^_")
         };
 
-        // Use list with no limit and count results
-        let (rev, events) = self
-            .list_internal(&like_prefix, start_key, 0, revision, false, true)
-            .await?;
+        // Match kine's prefix/startKey handling
+        let effective_start = if prefix.ends_with('/') {
+            if start_key == prefix { "" } else { start_key }
+        } else {
+            ""
+        };
 
-        Ok((rev, events.len() as i64))
+        if revision == 0 {
+            // Use kine_current for O(keys) count
+            let start_where = if effective_start.is_empty() {
+                String::new()
+            } else {
+                "AND cur.name >= ?".to_string()
+            };
+
+            let sql = format!(
+                "SELECT
+                    (SELECT MAX(rkv.id) FROM kine AS rkv),
+                    COUNT(*)
+                FROM kine AS kv
+                JOIN kine_current AS cur ON cur.id = kv.id
+                WHERE cur.name LIKE ? ESCAPE '^'
+                {start_where}
+                AND kv.deleted = 0"
+            );
+
+            let row = if effective_start.is_empty() {
+                sqlx::query_as::<_, (Option<i64>, i64)>(&sql)
+                    .bind(&like_prefix)
+                    .fetch_one(&self.pool)
+                    .await
+            } else {
+                sqlx::query_as::<_, (Option<i64>, i64)>(&sql)
+                    .bind(&like_prefix)
+                    .bind(effective_start)
+                    .fetch_one(&self.pool)
+                    .await
+            }
+            .map_err(|e| BackendError::Internal(e.to_string()))?;
+
+            let rev = row.0.unwrap_or(0);
+            let rev = if rev == 0 { self.cached_revision().await? } else { rev };
+            Ok((rev, row.1))
+        } else {
+            // Historical count via GROUP BY subquery
+            let (extra_where, query) = if effective_start.is_empty() {
+                (format!("AND mkv.id <= {revision}"), None)
+            } else {
+                (
+                    format!("AND mkv.name >= ? AND mkv.id <= {revision}"),
+                    Some(effective_start.to_string()),
+                )
+            };
+
+            let sql = format!(
+                "SELECT
+                    (SELECT MAX(rkv.id) FROM kine AS rkv),
+                    COUNT(c.theid)
+                FROM (
+                    SELECT kv.id AS theid
+                    FROM kine AS kv
+                    JOIN (
+                        SELECT MAX(mkv.id) AS id
+                        FROM kine AS mkv
+                        WHERE mkv.name LIKE ? ESCAPE '^'
+                        {extra_where}
+                        GROUP BY mkv.name
+                    ) AS maxkv ON maxkv.id = kv.id
+                    WHERE kv.deleted = 0
+                ) c"
+            );
+
+            let row = if let Some(ref sk) = query {
+                sqlx::query_as::<_, (Option<i64>, i64)>(&sql)
+                    .bind(&like_prefix)
+                    .bind(sk)
+                    .fetch_one(&self.pool)
+                    .await
+            } else {
+                sqlx::query_as::<_, (Option<i64>, i64)>(&sql)
+                    .bind(&like_prefix)
+                    .fetch_one(&self.pool)
+                    .await
+            }
+            .map_err(|e| BackendError::Internal(e.to_string()))?;
+
+            let rev = row.0.unwrap_or(0);
+            let rev = if rev == 0 { self.cached_revision().await? } else { rev };
+            Ok((rev, row.1))
+        }
     }
 
     async fn update(

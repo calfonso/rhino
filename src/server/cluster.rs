@@ -31,16 +31,24 @@ impl<B: Backend> Cluster for KvBridge<B> {
 
     async fn member_list(
         &self,
-        _request: Request<MemberListRequest>,
+        request: Request<MemberListRequest>,
     ) -> Result<Response<MemberListResponse>, Status> {
+        // Extract authority from gRPC metadata, matching kine's behavior
+        let authority = request
+            .metadata()
+            .get(":authority")
+            .and_then(|v| v.to_str().ok())
+            .map(|a| format!("http://{a}"))
+            .unwrap_or_else(|| "http://127.0.0.1:2379".to_string());
+
         Ok(Response::new(MemberListResponse {
             header: Some(ResponseHeader::default()),
             members: vec![Member {
-                id: 1,
-                name: "rhino".to_string(),
-                peer_ur_ls: vec!["http://127.0.0.1:2379".to_string()],
-                client_ur_ls: vec!["http://127.0.0.1:2379".to_string()],
+                name: "kine".to_string(),
+                peer_ur_ls: vec![authority.clone()],
+                client_ur_ls: vec![authority],
                 is_learner: false,
+                ..Default::default()
             }],
         }))
     }

@@ -53,6 +53,18 @@ impl<B: Backend> Watch for KvBridge<B> {
 
                 match req.request_union {
                     Some(watch_request::RequestUnion::CreateRequest(create)) => {
+                        // Reject client-provided watch IDs (kine only accepts AutoWatchID = 0)
+                        if create.watch_id != 0 {
+                            let _ = resp_tx.send(Ok(WatchResponse {
+                                header: Some(ResponseHeader::default()),
+                                watch_id: -1, // InvalidWatchID
+                                canceled: true,
+                                cancel_reason: "etcdserver: unsupported options in watch request".to_string(),
+                                ..Default::default()
+                            })).await;
+                            continue;
+                        }
+
                         let watch_id = WATCH_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
                         let raw_key = String::from_utf8_lossy(&create.key).to_string();
                         // Redirect compact_rev_key to internal key

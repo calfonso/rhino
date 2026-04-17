@@ -36,9 +36,14 @@ impl<B: Backend> RhinoServer<B> {
 
         let bridge = KvBridge::new(self.backend.clone());
 
+        // gRPC health service (matching kine)
+        let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
+        health_reporter.set_serving::<KvServer<KvBridge<B>>>().await;
+
         info!("rhino listening on {}", addr);
 
         Server::builder()
+            .add_service(health_service)
             .add_service(KvServer::new(bridge.clone()))
             .add_service(WatchServer::new(bridge.clone()))
             .add_service(LeaseServer::new(bridge.clone()))
