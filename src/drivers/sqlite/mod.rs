@@ -5,14 +5,14 @@
 //! row IDs; all mutations are appended as new rows. A background poll loop
 //! detects new rows and broadcasts them to watchers.
 
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteLockingMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::Row;
-use tokio::sync::{broadcast, mpsc, Notify};
+use tokio::sync::{mpsc, Mutex, Notify};
 use tracing::{debug, error, trace, warn};
 
 use crate::backend::{Backend, BackendError, Event, KeyValue, Result, WatchResult};
@@ -50,12 +50,51 @@ impl Default for SqliteConfig {
     }
 }
 
+/// Kine-style broadcaster: fans out events to per-subscriber channels.
+/// Slow subscribers are disconnected (channel dropped) rather than lagging.
+struct Broadcaster {
+    subscribers: Mutex<Vec<mpsc::Sender<Vec<Event>>>>,
+    started: AtomicBool,
+}
+
+impl Broadcaster {
+    fn new() -> Self {
+        Self {
+            subscribers: Mutex::new(Vec::new()),
+            started: AtomicBool::new(false),
+        }
+    }
+
+    /// Subscribe to events. Returns a receiver with capacity 100 (matching kine).
+    async fn subscribe(&self) -> mpsc::Receiver<Vec<Event>> {
+        let (tx, rx) = mpsc::channel(100);
+        self.subscribers.lock().await.push(tx);
+        rx
+    }
+
+    /// Broadcast events to all subscribers. Slow subscribers (full channel) are dropped.
+    async fn send(&self, events: Vec<Event>) {
+        let mut subs = self.subscribers.lock().await;
+        subs.retain(|tx| {
+            // try_send: if the subscriber's channel is full, drop it
+            match tx.try_send(events.clone()) {
+                Ok(()) => true,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    warn!("dropping slow watch subscriber");
+                    false
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => false,
+            }
+        });
+    }
+}
+
 /// SQLite-backed implementation of the rhino [`Backend`] trait.
 pub struct SqliteBackend {
     pool: SqlitePool,
     current_rev: Arc<AtomicI64>,
     notify: Arc<Notify>,
-    broadcast_tx: broadcast::Sender<Vec<Event>>,
+    broadcaster: Arc<Broadcaster>,
     config: SqliteConfig,
 }
 
@@ -99,13 +138,11 @@ impl SqliteBackend {
             .await
             .map_err(|e| BackendError::Internal(format!("failed to open database: {e}")))?;
 
-        let (broadcast_tx, _) = broadcast::channel(1024);
-
         Ok(Self {
             pool,
             current_rev: Arc::new(AtomicI64::new(0)),
             notify: Arc::new(Notify::new()),
-            broadcast_tx,
+            broadcaster: Arc::new(Broadcaster::new()),
             config,
         })
     }
@@ -114,12 +151,12 @@ impl SqliteBackend {
         let statements = [
             "CREATE TABLE IF NOT EXISTS kine (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                created INTEGER NOT NULL,
-                deleted INTEGER NOT NULL,
-                create_revision INTEGER NOT NULL,
-                prev_revision INTEGER NOT NULL,
-                lease INTEGER NOT NULL,
+                name INTEGER,
+                created INTEGER,
+                deleted INTEGER,
+                create_revision INTEGER,
+                prev_revision INTEGER,
+                lease INTEGER,
                 value BLOB,
                 old_value BLOB
             )",
@@ -246,7 +283,7 @@ impl SqliteBackend {
     async fn fill(&self, revision: i64) -> Result<()> {
         let name = format!("gap-{revision}");
         sqlx::query(
-            "INSERT OR IGNORE INTO kine(id, name, created, deleted, create_revision, prev_revision, lease, value, old_value)
+            "INSERT INTO kine(id, name, created, deleted, create_revision, prev_revision, lease, value, old_value)
              VALUES(?, ?, 0, 1, 0, 0, 0, NULL, NULL)",
         )
         .bind(revision)
@@ -364,13 +401,10 @@ impl SqliteBackend {
             }
         } else {
             // Historical query: must scan revisions up to the requested revision
-            let (extra_where, query) = if start_key.is_empty() {
-                (format!("AND mkv.id <= {revision}"), None)
+            let start_where = if start_key.is_empty() {
+                String::new()
             } else {
-                (
-                    format!("AND mkv.name >= ? AND mkv.id <= {revision}"),
-                    Some(start_key.to_string()),
-                )
+                "AND mkv.name >= ?".to_string()
             };
 
             let sql = format!(
@@ -390,7 +424,8 @@ impl SqliteBackend {
                     SELECT MAX(mkv.id) AS id
                     FROM kine AS mkv
                     WHERE mkv.name LIKE ? ESCAPE '^'
-                    {extra_where}
+                    {start_where}
+                    AND mkv.id <= ?
                     GROUP BY mkv.name
                 ) AS maxkv ON maxkv.id = kv.id
                 WHERE (kv.deleted = 0 OR ?)
@@ -398,16 +433,18 @@ impl SqliteBackend {
                 {limit_clause}"
             );
 
-            if let Some(ref sk) = query {
+            if start_key.is_empty() {
                 sqlx::query(&sql)
                     .bind(prefix)
-                    .bind(sk)
+                    .bind(revision)
                     .bind(include_deleted_val)
                     .fetch_all(&self.pool)
                     .await
             } else {
                 sqlx::query(&sql)
                     .bind(prefix)
+                    .bind(start_key)
+                    .bind(revision)
                     .bind(include_deleted_val)
                     .fetch_all(&self.pool)
                     .await
@@ -574,6 +611,40 @@ impl SqliteBackend {
         Ok(self.current_rev.load(Ordering::Acquire))
     }
 
+    /// Start background tasks lazily on first watch subscription (matching kine's startWatch).
+    fn ensure_background_tasks(&self) {
+        if self
+            .broadcaster
+            .started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            // Create shared references for background tasks
+            let pool = self.pool.clone();
+            let current_rev = self.current_rev.clone();
+            let notify = self.notify.clone();
+            let broadcaster = self.broadcaster.clone();
+            let config = self.config.clone();
+
+            let make_backend = move || SqliteBackend {
+                pool: pool.clone(),
+                current_rev: current_rev.clone(),
+                notify: notify.clone(),
+                broadcaster: broadcaster.clone(),
+                config: config.clone(),
+            };
+
+            let poll_self = Arc::new(make_backend());
+            let compact_self = Arc::new(make_backend());
+            let ttl_self = Arc::new(make_backend());
+
+            tokio::spawn(async move { poll_self.poll_loop().await });
+            tokio::spawn(async move { compact_self.compact_loop().await });
+            tokio::spawn(async move { ttl_self.ttl_loop().await });
+            debug!("background tasks started (first watch subscription)");
+        }
+    }
+
     /// Background poll loop: detects new revisions and broadcasts events to watchers.
     async fn poll_loop(self: Arc<Self>) {
         let mut poll_revision = match self.db_current_revision().await {
@@ -662,8 +733,7 @@ impl SqliteBackend {
                 poll_revision = rev;
 
                 if !sequential.is_empty() {
-                    // Best-effort broadcast; if no receivers, that's fine
-                    let _ = self.broadcast_tx.send(sequential);
+                    self.broadcaster.send(sequential).await;
                 }
             }
         }
@@ -700,8 +770,8 @@ impl SqliteBackend {
             );
         }
 
-        // Subscribe to broadcast to track new leased keys
-        let mut broadcast_rx = self.broadcast_tx.subscribe();
+        // Subscribe to broadcaster to track new leased keys
+        let mut broadcast_rx = self.broadcaster.subscribe().await;
 
         let mut check_interval = tokio::time::interval(Duration::from_secs(1));
 
@@ -734,7 +804,7 @@ impl SqliteBackend {
                 }
                 result = broadcast_rx.recv() => {
                     match result {
-                        Ok(events) => {
+                        Some(events) => {
                             let now = Instant::now();
                             for event in &events {
                                 if event.delete {
@@ -750,8 +820,7 @@ impl SqliteBackend {
                                 }
                             }
                         }
-                        Err(broadcast::error::RecvError::Lagged(_)) => {}
-                        Err(broadcast::error::RecvError::Closed) => break,
+                        None => break,
                     }
                 }
             }
@@ -915,25 +984,6 @@ impl Backend for SqliteBackend {
             Ok(_) | Err(BackendError::KeyExists) => {}
             Err(e) => warn!("failed to create health check key: {e}"),
         }
-
-        // Start background loops. All share the same pool, current_rev,
-        // notify, and broadcast_tx via Arc, so inserts on the main instance
-        // wake the poll loop and revision updates are visible everywhere.
-        let shared = Arc::new(SqliteBackend {
-            pool: self.pool.clone(),
-            current_rev: self.current_rev.clone(),
-            notify: self.notify.clone(),
-            broadcast_tx: self.broadcast_tx.clone(),
-            config: self.config.clone(),
-        });
-
-        let poll_self = shared.clone();
-        let compact_self = shared.clone();
-        let ttl_self = shared;
-
-        tokio::spawn(async move { poll_self.poll_loop().await });
-        tokio::spawn(async move { compact_self.compact_loop().await });
-        tokio::spawn(async move { ttl_self.ttl_loop().await });
 
         debug!("sqlite backend started");
         Ok(())
@@ -1206,6 +1256,9 @@ impl Backend for SqliteBackend {
     }
 
     async fn watch(&self, key: &str, revision: i64) -> Result<WatchResult> {
+        // Start background tasks lazily on first watch (matching kine's startWatch)
+        self.ensure_background_tasks();
+
         let (tx, rx) = mpsc::channel(100);
 
         // Get current revision for the result
@@ -1217,7 +1270,7 @@ impl Backend for SqliteBackend {
             return Err(BackendError::Compacted);
         }
 
-        let mut broadcast_rx = self.broadcast_tx.subscribe();
+        let mut broadcast_rx = self.broadcaster.subscribe().await;
         let prefix = key.to_string();
 
         // First, send any historical events since the requested revision
@@ -1314,7 +1367,7 @@ impl Backend for SqliteBackend {
             let check_prefix = prefix.ends_with('/');
             loop {
                 match broadcast_rx.recv().await {
-                    Ok(events) => {
+                    Some(events) => {
                         let filtered: Vec<Event> = events
                             .into_iter()
                             .filter(|e| {
@@ -1330,10 +1383,7 @@ impl Backend for SqliteBackend {
                                 return;
                             }
                     }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("watch subscriber lagged by {n} events");
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
+                    None => {
                         return;
                     }
                 }

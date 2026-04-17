@@ -129,9 +129,14 @@ impl<B: Backend> Watch for KvBridge<B> {
                             loop {
                                 tokio::select! {
                                     event_batch = events_rx.recv() => {
-                                        let Some(events) = event_batch else {
+                                        let Some(mut events) = event_batch else {
                                             break; // Channel closed
                                         };
+
+                                        // Coalesce queued batches (matching kine's event batching)
+                                        while let Ok(more) = events_rx.try_recv() {
+                                            events.extend(more);
+                                        }
 
                                         let proto_events: Vec<mvccpb::Event> = events
                                             .iter()
