@@ -7,6 +7,11 @@ use crate::proto::mvccpb;
 
 use super::KvBridge;
 
+/// The key the Kubernetes API server uses for its compaction state.
+const COMPACT_REV_KEY: &str = "compact_rev_key";
+/// Internal storage key to avoid collision with rhino's own compact_rev_key.
+const COMPACT_REV_KEY_API: &str = "compact_rev_key_apiserver";
+
 fn response_header(rev: i64) -> Option<ResponseHeader> {
     Some(ResponseHeader {
         revision: rev,
@@ -152,6 +157,60 @@ fn is_delete(txn: &TxnRequest) -> Option<(i64, &[u8])> {
     None
 }
 
+/// Detect the Compact transaction pattern used by the Kubernetes API server:
+/// Compare: VERSION == N on key "compact_rev_key"
+/// Success: single Put
+/// Failure: single Range
+fn is_compact(txn: &TxnRequest) -> Option<(i64, &[u8])> {
+    if txn.compare.len() == 1
+        && txn.compare[0].target() == compare::CompareTarget::Version
+        && txn.compare[0].result() == compare::CompareResult::Equal
+        && txn.compare[0].key == COMPACT_REV_KEY.as_bytes()
+        && txn.success.len() == 1
+        && txn.failure.len() == 1
+    {
+        let put = txn.success[0].request.as_ref().and_then(|r| match r {
+            request_op::Request::RequestPut(put) => Some(put),
+            _ => None,
+        })?;
+        txn.failure[0].request.as_ref().and_then(|r| match r {
+            request_op::Request::RequestRange(_) => Some(()),
+            _ => None,
+        })?;
+        Some((txn.compare[0].version(), &put.value))
+    } else {
+        None
+    }
+}
+
+/// Redirect compact_rev_key to internal key to avoid collision.
+fn redirect_key(key: &str) -> &str {
+    if key == COMPACT_REV_KEY {
+        COMPACT_REV_KEY_API
+    } else {
+        key
+    }
+}
+
+/// Encode a version + value for compact_rev_key storage.
+fn encode_version(version: i64, value: &[u8]) -> Vec<u8> {
+    format!("{}|", version).into_bytes().into_iter().chain(value.iter().copied()).collect()
+}
+
+/// Decode a version + value from compact_rev_key storage.
+fn decode_version(data: &[u8]) -> (i64, Vec<u8>) {
+    if let Some(pos) = data.iter().position(|&b| b == b'|') {
+        let version_str = String::from_utf8_lossy(&data[..pos]);
+        let version = version_str.parse::<i64>().unwrap_or(0);
+        let value = data[pos + 1..].to_vec();
+        (version, value)
+    } else {
+        // Old format: just the version number
+        let version = String::from_utf8_lossy(data).parse::<i64>().unwrap_or(0);
+        (version, b"0".to_vec())
+    }
+}
+
 /// Helper to access fields from a Compare's target_union.
 trait CompareExt {
     fn mod_revision(&self) -> i64;
@@ -201,16 +260,29 @@ impl<B: Backend> KvBridge<B> {
         &self,
         r: &RangeRequest,
     ) -> Result<RangeResponse, Status> {
-        let key = String::from_utf8_lossy(&r.key);
+        let raw_key = String::from_utf8_lossy(&r.key);
+        let key = redirect_key(&raw_key);
         let range_end = String::from_utf8_lossy(&r.range_end);
 
         let (rev, kv) = self
             .backend
-            .get(&key, &range_end, r.limit, r.revision, r.keys_only)
+            .get(key, &range_end, r.limit, r.revision, r.keys_only)
             .await
             .map_err(backend_err_to_status)?;
 
-        let kvs = to_proto_kvs(kv.as_ref());
+        let kvs = if key != raw_key.as_ref() {
+            // Redirected key — rewrite key and decode version in response
+            kv.as_ref().map(|kv| {
+                let (version, value) = decode_version(&kv.value);
+                let mut proto = to_proto_kv(kv);
+                proto.key = raw_key.as_bytes().to_vec();
+                proto.value = value;
+                proto.version = version;
+                vec![proto]
+            }).unwrap_or_default()
+        } else {
+            to_proto_kvs(kv.as_ref())
+        };
         let count = kvs.len() as i64;
         Ok(RangeResponse {
             header: response_header(rev),
@@ -443,6 +515,97 @@ impl<B: Backend> KvBridge<B> {
         }
     }
 
+    /// Handle the compact_rev_key Txn pattern from the Kubernetes API server.
+    /// Version-checks the stored compact key, updates it on match.
+    async fn handle_compact_txn(
+        &self,
+        expected_version: i64,
+        new_value: &[u8],
+    ) -> Result<TxnResponse, Status> {
+        let key = COMPACT_REV_KEY_API;
+
+        // Get current state
+        let (current_rev, existing) = self
+            .backend
+            .get(key, "", 1, 0, false)
+            .await
+            .map_err(backend_err_to_status)?;
+
+        let (current_version, current_value) = existing
+            .as_ref()
+            .map(|kv| decode_version(&kv.value))
+            .unwrap_or((0, b"0".to_vec()));
+
+        if current_version == expected_version {
+            // Version matches — update with incremented version
+            let new_version = current_version + 1;
+            let encoded = encode_version(new_version, new_value);
+
+            let rev = if expected_version == 0 {
+                // First time: create
+                match self.backend.create(key, &encoded, 0).await {
+                    Ok(rev) => rev,
+                    Err(BackendError::KeyExists) => {
+                        // Race: someone else created it. Get and update.
+                        let (_, kv) = self.backend.get(key, "", 1, 0, false).await
+                            .map_err(backend_err_to_status)?;
+                        let mod_rev = kv.as_ref().map(|k| k.mod_revision).unwrap_or(0);
+                        let (rev, _, _) = self.backend.update(key, &encoded, mod_rev, 0).await
+                            .map_err(backend_err_to_status)?;
+                        rev
+                    }
+                    Err(e) => return Err(backend_err_to_status(e)),
+                }
+            } else {
+                let mod_rev = existing.as_ref().map(|kv| kv.mod_revision).unwrap_or(0);
+                let (rev, _, _) = self
+                    .backend
+                    .update(key, &encoded, mod_rev, 0)
+                    .await
+                    .map_err(backend_err_to_status)?;
+                rev
+            };
+
+            Ok(TxnResponse {
+                header: response_header(rev),
+                succeeded: true,
+                responses: vec![ResponseOp {
+                    response: Some(response_op::Response::ResponsePut(PutResponse {
+                        header: response_header(rev),
+                        prev_kv: None,
+                    })),
+                }],
+            })
+        } else {
+            // Version mismatch — return current state
+            let kv = existing.as_ref().map(|kv| {
+                let mut proto = to_proto_kv(kv);
+                // Rewrite key back to what the client expects
+                proto.key = COMPACT_REV_KEY.as_bytes().to_vec();
+                proto.value = current_value.clone();
+                proto.version = current_version;
+                proto
+            });
+            let kvs = kv.into_iter().collect::<Vec<_>>();
+            let count = kvs.len() as i64;
+
+            Ok(TxnResponse {
+                header: response_header(current_rev),
+                succeeded: false,
+                responses: vec![ResponseOp {
+                    response: Some(response_op::Response::ResponseRange(
+                        RangeResponse {
+                            header: response_header(current_rev),
+                            kvs,
+                            count,
+                            more: false,
+                        },
+                    )),
+                }],
+            })
+        }
+    }
+
     async fn handle_delete(
         &self,
         key: &[u8],
@@ -594,6 +757,12 @@ impl<B: Backend> Kv for KvBridge<B> {
         if let Some((rev, key)) = is_delete(&txn) {
             let key = key.to_vec();
             return Ok(Response::new(self.handle_delete(&key, rev).await?));
+        }
+        if let Some((version, value)) = is_compact(&txn) {
+            let value = value.to_vec();
+            return Ok(Response::new(
+                self.handle_compact_txn(version, &value).await?,
+            ));
         }
 
         Err(Status::invalid_argument(

@@ -21,6 +21,10 @@ struct Args {
     #[arg(long, default_value = "300")]
     compact_interval: u64,
 
+    /// Minimum number of recent revisions to retain during compaction
+    #[arg(long, default_value = "1000")]
+    compact_retention: i64,
+
     /// Maximum database connection pool size
     #[arg(long, default_value = "10")]
     max_connections: u32,
@@ -42,6 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let config = PostgresConfig {
             dsn: args.endpoint,
             compact_interval,
+            compact_min_retain: args.compact_retention,
             max_connections: args.max_connections,
             ..Default::default()
         };
@@ -51,6 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let config = MysqlConfig {
             dsn: args.endpoint,
             compact_interval,
+            compact_min_retain: args.compact_retention,
             max_connections: args.max_connections,
             ..Default::default()
         };
@@ -60,6 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let config = SqliteConfig {
             dsn: args.endpoint,
             compact_interval,
+            compact_min_retain: args.compact_retention,
             max_connections: args.max_connections,
             ..Default::default()
         };

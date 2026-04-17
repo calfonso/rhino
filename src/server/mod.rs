@@ -2,6 +2,7 @@ mod kv;
 mod watch;
 mod lease;
 mod maintenance;
+mod cluster;
 
 use std::sync::Arc;
 use tonic::transport::Server;
@@ -10,7 +11,7 @@ use tracing::info;
 use crate::backend::Backend;
 use crate::proto::etcdserverpb::{
     kv_server::KvServer, watch_server::WatchServer, lease_server::LeaseServer,
-    maintenance_server::MaintenanceServer,
+    maintenance_server::MaintenanceServer, cluster_server::ClusterServer,
 };
 
 /// The main rhino server that bridges the etcd gRPC API to a Backend implementation.
@@ -42,6 +43,7 @@ impl<B: Backend> RhinoServer<B> {
             .add_service(WatchServer::new(bridge.clone()))
             .add_service(LeaseServer::new(bridge.clone()))
             .add_service(MaintenanceServer::new(bridge.clone()))
+            .add_service(ClusterServer::new(bridge.clone()))
             .serve(addr)
             .await?;
 

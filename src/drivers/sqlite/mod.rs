@@ -78,7 +78,19 @@ impl SqliteBackend {
             .locking_mode(SqliteLockingMode::Normal)
             .synchronous(SqliteSynchronous::Normal)
             .busy_timeout(Duration::from_secs(30))
-            .pragma("cache_size", "-2000");
+            .pragma("cache_size", "-2000")
+            .pragma("auto_vacuum", "incremental");
+
+        // Run startup VACUUM on a single connection before creating the pool.
+        // VACUUM requires exclusive access and can't run with pooled connections.
+        {
+            use sqlx::ConnectOptions;
+            if let Ok(mut conn) = opts.clone().connect().await {
+                if let Err(e) = sqlx::query("VACUUM").execute(&mut conn).await {
+                    warn!("startup VACUUM failed (non-fatal): {e}");
+                }
+            }
+        }
 
         let pool = SqlitePoolOptions::new()
             .max_connections(config.max_connections)
@@ -119,6 +131,7 @@ impl SqliteBackend {
             "CREATE INDEX IF NOT EXISTS kine_id_deleted_index ON kine (id, deleted)",
             "CREATE INDEX IF NOT EXISTS kine_prev_revision_index ON kine (prev_revision)",
             "CREATE UNIQUE INDEX IF NOT EXISTS kine_name_prev_revision_uindex ON kine (name, prev_revision)",
+            "CREATE INDEX IF NOT EXISTS kine_id_compact_rev_key_with_prev_revision_index ON kine(id, name, prev_revision) WHERE name != 'compact_rev_key' AND prev_revision != 0",
         ];
 
         for stmt in &statements {
@@ -218,7 +231,7 @@ impl SqliteBackend {
         let name = format!("gap-{revision}");
         sqlx::query(
             "INSERT OR IGNORE INTO kine(id, name, created, deleted, create_revision, prev_revision, lease, value, old_value)
-             VALUES(?, ?, 0, 1, 0, 0, 0, NULL, NULL)",
+             VALUES(?, ?, 0, 1, 1, 0, 0, NULL, NULL)",
         )
         .bind(revision)
         .bind(&name)
@@ -640,6 +653,95 @@ impl SqliteBackend {
         }
     }
 
+    /// Background TTL expiration loop: deletes keys whose lease has expired.
+    /// Tracks expiry times in memory, matching kine's approach.
+    async fn ttl_loop(self: Arc<Self>) {
+        use std::collections::HashMap;
+        use tokio::time::Instant;
+
+        // Wait for initial data to settle
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // Map: key_name -> (mod_revision, expires_at)
+        let mut expiries: HashMap<String, (i64, Instant)> = HashMap::new();
+
+        // Seed from existing leased keys
+        let rows = sqlx::query_as::<_, (String, i64, i64)>(
+            "SELECT kv.name, kv.lease, kv.id
+             FROM kine AS kv
+             JOIN kine_current AS cur ON cur.id = kv.id
+             WHERE kv.lease > 0 AND kv.deleted = 0",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+
+        let now = Instant::now();
+        for (name, lease, mod_rev) in rows {
+            expiries.insert(
+                name,
+                (mod_rev, now + Duration::from_secs(lease as u64)),
+            );
+        }
+
+        // Subscribe to broadcast to track new leased keys
+        let mut broadcast_rx = self.broadcast_tx.subscribe();
+
+        let mut check_interval = tokio::time::interval(Duration::from_secs(1));
+
+        loop {
+            tokio::select! {
+                _ = check_interval.tick() => {
+                    // Check for expired keys
+                    let now = Instant::now();
+                    let expired: Vec<(String, i64)> = expiries
+                        .iter()
+                        .filter(|(_, (_, exp))| now >= *exp)
+                        .map(|(k, (rev, _))| (k.clone(), *rev))
+                        .collect();
+
+                    for (key, mod_rev) in expired {
+                        match self.delete(&key, mod_rev).await {
+                            Ok((_, _, true)) => {
+                                trace!("ttl: deleted expired key {key}");
+                                expiries.remove(&key);
+                            }
+                            Ok((_, _, false)) => {
+                                // Key was updated (different revision) — remove stale tracking
+                                expiries.remove(&key);
+                            }
+                            Err(e) => {
+                                warn!("ttl: failed to delete expired key {key}: {e}");
+                            }
+                        }
+                    }
+                }
+                result = broadcast_rx.recv() => {
+                    match result {
+                        Ok(events) => {
+                            let now = Instant::now();
+                            for event in &events {
+                                if event.delete {
+                                    expiries.remove(&event.kv.key);
+                                } else if event.kv.lease > 0 {
+                                    expiries.insert(
+                                        event.kv.key.clone(),
+                                        (event.kv.mod_revision, now + Duration::from_secs(event.kv.lease as u64)),
+                                    );
+                                } else {
+                                    // Key updated without lease — stop tracking
+                                    expiries.remove(&event.kv.key);
+                                }
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
+        }
+    }
+
     /// Background compaction loop.
     async fn compact_loop(self: Arc<Self>) {
         if self.config.compact_interval.is_zero() {
@@ -706,6 +808,26 @@ impl SqliteBackend {
             .await
             .map_err(|e| BackendError::Internal(e.to_string()))?;
 
+            // Clean up kine_current: remove entries pointing to deleted keys
+            // whose tombstone rows were just compacted away
+            let cleaned = sqlx::query(
+                "DELETE FROM kine_current WHERE name IN (
+                    SELECT cur.name FROM kine_current AS cur
+                    LEFT JOIN kine AS kv ON cur.id = kv.id
+                    WHERE kv.id IS NULL
+                )",
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| BackendError::Internal(e.to_string()))?;
+
+            if cleaned.rows_affected() > 0 {
+                debug!(
+                    "cleaned {} dangling kine_current entries",
+                    cleaned.rows_affected()
+                );
+            }
+
             // Update compact_rev_key
             sqlx::query("UPDATE kine SET prev_revision = ? WHERE name = ?")
                 .bind(iter_rev)
@@ -726,8 +848,13 @@ impl SqliteBackend {
             );
         }
 
-        // Post-compact: WAL checkpoint
+        // Post-compact: checkpoint WAL and reclaim disk space
         sqlx::query("PRAGMA wal_checkpoint(FULL)")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| BackendError::Internal(e.to_string()))?;
+
+        sqlx::query("PRAGMA incremental_vacuum")
             .execute(&self.pool)
             .await
             .map_err(|e| BackendError::Internal(e.to_string()))?;
@@ -768,8 +895,17 @@ impl Backend for SqliteBackend {
             config: self.config.clone(),
         });
 
+        let ttl_self = Arc::new(SqliteBackend {
+            pool: self.pool.clone(),
+            current_rev: AtomicI64::new(0),
+            notify: Notify::new(),
+            broadcast_tx: self.broadcast_tx.clone(),
+            config: self.config.clone(),
+        });
+
         tokio::spawn(async move { poll_self.poll_loop().await });
         tokio::spawn(async move { compact_self.compact_loop().await });
+        tokio::spawn(async move { ttl_self.ttl_loop().await });
 
         debug!("sqlite backend started");
         Ok(())
@@ -1121,6 +1257,18 @@ impl Backend for SqliteBackend {
         .bind(COMPACT_REV_KEY)
         .bind(target)
         .bind(target)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| BackendError::Internal(e.to_string()))?;
+
+        // Clean up kine_current: remove entries pointing to deleted rows
+        sqlx::query(
+            "DELETE FROM kine_current WHERE name IN (
+                SELECT cur.name FROM kine_current AS cur
+                LEFT JOIN kine AS kv ON cur.id = kv.id
+                WHERE kv.id IS NULL
+            )",
+        )
         .execute(&self.pool)
         .await
         .map_err(|e| BackendError::Internal(e.to_string()))?;

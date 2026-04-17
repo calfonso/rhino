@@ -18,10 +18,7 @@ impl<B: Backend> Maintenance for KvBridge<B> {
         &self,
         _request: Request<AlarmRequest>,
     ) -> Result<Response<AlarmResponse>, Status> {
-        Ok(Response::new(AlarmResponse {
-            header: Some(ResponseHeader::default()),
-            alarms: vec![],
-        }))
+        Err(Status::unknown("alarm is not supported"))
     }
 
     async fn status(
@@ -46,9 +43,7 @@ impl<B: Backend> Maintenance for KvBridge<B> {
         &self,
         _request: Request<DefragmentRequest>,
     ) -> Result<Response<DefragmentResponse>, Status> {
-        Ok(Response::new(DefragmentResponse {
-            header: Some(ResponseHeader::default()),
-        }))
+        Err(Status::unknown("defragment is not supported"))
     }
 
     async fn hash(

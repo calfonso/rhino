@@ -18,11 +18,10 @@ impl<B: Backend> Lease for KvBridge<B> {
         request: Request<LeaseGrantRequest>,
     ) -> Result<Response<LeaseGrantResponse>, Status> {
         let r = request.into_inner();
-        // Rhino doesn't implement full lease management.
-        // Return the requested TTL/ID back as-is (kine does the same).
+        // Kine returns TTL as the lease ID (not a unique identifier).
         Ok(Response::new(LeaseGrantResponse {
             header: Some(ResponseHeader::default()),
-            id: r.id,
+            id: r.ttl,
             ttl: r.ttl,
             error: String::new(),
         }))
@@ -32,9 +31,7 @@ impl<B: Backend> Lease for KvBridge<B> {
         &self,
         _request: Request<LeaseRevokeRequest>,
     ) -> Result<Response<LeaseRevokeResponse>, Status> {
-        Ok(Response::new(LeaseRevokeResponse {
-            header: Some(ResponseHeader::default()),
-        }))
+        Err(Status::unknown("lease revoke is not supported"))
     }
 
     type LeaseKeepAliveStream = LeaseKeepAliveStream;
@@ -43,43 +40,20 @@ impl<B: Backend> Lease for KvBridge<B> {
         &self,
         _request: Request<Streaming<LeaseKeepAliveRequest>>,
     ) -> Result<Response<Self::LeaseKeepAliveStream>, Status> {
-        // Minimal keepalive: echo back the request IDs.
-        let in_stream = _request.into_inner();
-        let output = async_stream::try_stream! {
-            let mut stream = in_stream;
-            while let Some(req) = tokio_stream::StreamExt::next(&mut stream).await {
-                let req = req?;
-                yield LeaseKeepAliveResponse {
-                    header: Some(ResponseHeader::default()),
-                    id: req.id,
-                    ttl: 30, // default TTL
-                };
-            }
-        };
-        Ok(Response::new(Box::pin(output) as Self::LeaseKeepAliveStream))
+        Err(Status::unknown("lease keep alive is not supported"))
     }
 
     async fn lease_time_to_live(
         &self,
-        request: Request<LeaseTimeToLiveRequest>,
+        _request: Request<LeaseTimeToLiveRequest>,
     ) -> Result<Response<LeaseTimeToLiveResponse>, Status> {
-        let r = request.into_inner();
-        Ok(Response::new(LeaseTimeToLiveResponse {
-            header: Some(ResponseHeader::default()),
-            id: r.id,
-            ttl: 30,
-            granted_ttl: 30,
-            keys: vec![],
-        }))
+        Err(Status::unknown("lease time to live is not supported"))
     }
 
     async fn lease_leases(
         &self,
         _request: Request<LeaseLeasesRequest>,
     ) -> Result<Response<LeaseLeasesResponse>, Status> {
-        Ok(Response::new(LeaseLeasesResponse {
-            header: Some(ResponseHeader::default()),
-            leases: vec![],
-        }))
+        Err(Status::unknown("lease leases is not supported"))
     }
 }
