@@ -39,21 +39,32 @@ fn backend_err_to_status(e: BackendError) -> Status {
 }
 
 /// Detect the Create transaction pattern:
-/// Compare: single MOD == 0
-/// Success: single Put
+/// Compare: single MOD == 0 or VERSION == 0
+/// Success: Put, optionally followed by Range ops
 /// Failure: empty
 fn is_create(txn: &TxnRequest) -> Option<&PutRequest> {
     if txn.compare.len() == 1
-        && txn.compare[0].target() == compare::CompareTarget::Mod
         && txn.compare[0].result() == compare::CompareResult::Equal
-        && txn.compare[0].mod_revision() == 0
+        && ((txn.compare[0].target() == compare::CompareTarget::Mod
+            && txn.compare[0].mod_revision() == 0)
+            || (txn.compare[0].target() == compare::CompareTarget::Version
+                && txn.compare[0].version() == 0))
         && txn.failure.is_empty()
-        && txn.success.len() == 1
+        && txn.success.len() >= 1
     {
-        txn.success[0].request.as_ref().and_then(|r| match r {
+        // First op must be a Put
+        let put = txn.success[0].request.as_ref().and_then(|r| match r {
             request_op::Request::RequestPut(put) => Some(put),
             _ => None,
-        })
+        })?;
+        // All remaining ops must be Range requests
+        for op in &txn.success[1..] {
+            match op.request.as_ref() {
+                Some(request_op::Request::RequestRange(_)) => {}
+                _ => return None,
+            }
+        }
+        Some(put)
     } else {
         None
     }
@@ -61,19 +72,26 @@ fn is_create(txn: &TxnRequest) -> Option<&PutRequest> {
 
 /// Detect the Update transaction pattern:
 /// Compare: single MOD == expected_rev
-/// Success: single Put
+/// Success: Put, optionally followed by Range ops
 /// Failure: single Range
 fn is_update(txn: &TxnRequest) -> Option<(i64, &[u8], &[u8], i64)> {
     if txn.compare.len() == 1
         && txn.compare[0].target() == compare::CompareTarget::Mod
         && txn.compare[0].result() == compare::CompareResult::Equal
-        && txn.success.len() == 1
+        && txn.success.len() >= 1
         && txn.failure.len() == 1
     {
         let put = txn.success[0].request.as_ref().and_then(|r| match r {
             request_op::Request::RequestPut(put) => Some(put),
             _ => None,
         })?;
+        // All remaining success ops must be Range requests
+        for op in &txn.success[1..] {
+            match op.request.as_ref() {
+                Some(request_op::Request::RequestRange(_)) => {}
+                _ => return None,
+            }
+        }
         // Verify failure is a Range
         txn.failure[0].request.as_ref().and_then(|r| match r {
             request_op::Request::RequestRange(_) => Some(()),
@@ -134,9 +152,10 @@ fn is_delete(txn: &TxnRequest) -> Option<(i64, &[u8])> {
     None
 }
 
-/// Helper to access the mod_revision from a Compare's target_union.
+/// Helper to access fields from a Compare's target_union.
 trait CompareExt {
     fn mod_revision(&self) -> i64;
+    fn version(&self) -> i64;
 }
 
 impl CompareExt for Compare {
@@ -146,6 +165,24 @@ impl CompareExt for Compare {
             _ => 0,
         }
     }
+
+    fn version(&self) -> i64 {
+        match &self.target_union {
+            Some(compare::TargetUnion::Version(v)) => *v,
+            _ => 0,
+        }
+    }
+}
+
+/// Extract Range requests from success ops after the first (Put) op.
+fn extract_trailing_ranges(success: &[RequestOp]) -> Vec<RangeRequest> {
+    success[1..]
+        .iter()
+        .filter_map(|op| match op.request.as_ref() {
+            Some(request_op::Request::RequestRange(r)) => Some(r.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 impl<B: Backend> KvBridge<B> {
@@ -251,6 +288,7 @@ impl<B: Backend> KvBridge<B> {
     async fn handle_create(
         &self,
         put: &PutRequest,
+        trailing_ranges: &[RangeRequest],
     ) -> Result<TxnResponse, Status> {
         if put.ignore_lease {
             return Err(Status::unimplemented("ignoreLease is not implemented"));
@@ -265,16 +303,25 @@ impl<B: Backend> KvBridge<B> {
         let key = String::from_utf8_lossy(&put.key);
 
         match self.backend.create(&key, &put.value, put.lease).await {
-            Ok(rev) => Ok(TxnResponse {
-                header: response_header(rev),
-                succeeded: true,
-                responses: vec![ResponseOp {
+            Ok(rev) => {
+                let mut responses = vec![ResponseOp {
                     response: Some(response_op::Response::ResponsePut(PutResponse {
                         header: response_header(rev),
                         prev_kv: None,
                     })),
-                }],
-            }),
+                }];
+                for r in trailing_ranges {
+                    let range_resp = self.handle_range(r).await?;
+                    responses.push(ResponseOp {
+                        response: Some(response_op::Response::ResponseRange(range_resp)),
+                    });
+                }
+                Ok(TxnResponse {
+                    header: response_header(rev),
+                    succeeded: true,
+                    responses,
+                })
+            }
             Err(BackendError::KeyExists) => {
                 let rev = self
                     .backend
@@ -297,6 +344,7 @@ impl<B: Backend> KvBridge<B> {
         key: &[u8],
         value: &[u8],
         lease: i64,
+        trailing_ranges: &[RangeRequest],
     ) -> Result<TxnResponse, Status> {
         let key_str = String::from_utf8_lossy(key);
 
@@ -304,17 +352,24 @@ impl<B: Backend> KvBridge<B> {
             // rev==0 means "create if not exists, get current if exists"
             match self.backend.create(&key_str, value, lease).await {
                 Ok(new_rev) => {
+                    let mut responses = vec![ResponseOp {
+                        response: Some(response_op::Response::ResponsePut(
+                            PutResponse {
+                                header: response_header(new_rev),
+                                prev_kv: None,
+                            },
+                        )),
+                    }];
+                    for r in trailing_ranges {
+                        let range_resp = self.handle_range(r).await?;
+                        responses.push(ResponseOp {
+                            response: Some(response_op::Response::ResponseRange(range_resp)),
+                        });
+                    }
                     return Ok(TxnResponse {
                         header: response_header(new_rev),
                         succeeded: true,
-                        responses: vec![ResponseOp {
-                            response: Some(response_op::Response::ResponsePut(
-                                PutResponse {
-                                    header: response_header(new_rev),
-                                    prev_kv: None,
-                                },
-                            )),
-                        }],
+                        responses,
                     });
                 }
                 Err(BackendError::KeyExists) => {
@@ -351,15 +406,22 @@ impl<B: Backend> KvBridge<B> {
             .map_err(backend_err_to_status)?;
 
         if ok {
+            let mut responses = vec![ResponseOp {
+                response: Some(response_op::Response::ResponsePut(PutResponse {
+                    header: response_header(new_rev),
+                    prev_kv: None,
+                })),
+            }];
+            for r in trailing_ranges {
+                let range_resp = self.handle_range(r).await?;
+                responses.push(ResponseOp {
+                    response: Some(response_op::Response::ResponseRange(range_resp)),
+                });
+            }
             Ok(TxnResponse {
                 header: response_header(new_rev),
                 succeeded: true,
-                responses: vec![ResponseOp {
-                    response: Some(response_op::Response::ResponsePut(PutResponse {
-                        header: response_header(new_rev),
-                        prev_kv: None,
-                    })),
-                }],
+                responses,
             })
         } else {
             let kvs = to_proto_kvs(kv.as_ref());
@@ -443,20 +505,68 @@ impl<B: Backend> Kv for KvBridge<B> {
 
     async fn put(
         &self,
-        _request: Request<PutRequest>,
+        request: Request<PutRequest>,
     ) -> Result<Response<PutResponse>, Status> {
-        Err(Status::unimplemented(
-            "direct Put is not supported; use Txn",
-        ))
+        let put = request.into_inner();
+        let key = String::from_utf8_lossy(&put.key);
+
+        // Try create first; if key exists, update unconditionally.
+        match self.backend.create(&key, &put.value, put.lease).await {
+            Ok(rev) => Ok(Response::new(PutResponse {
+                header: response_header(rev),
+                prev_kv: None,
+            })),
+            Err(BackendError::KeyExists) => {
+                // Get current revision so we can do an unconditional update.
+                let (_, existing) = self
+                    .backend
+                    .get(&key, "", 1, 0, false)
+                    .await
+                    .map_err(backend_err_to_status)?;
+                let mod_rev = existing.as_ref().map(|kv| kv.mod_revision).unwrap_or(0);
+                let prev_kv = if put.prev_kv {
+                    existing.as_ref().map(to_proto_kv)
+                } else {
+                    None
+                };
+                let (new_rev, _, _) = self
+                    .backend
+                    .update(&key, &put.value, mod_rev, put.lease)
+                    .await
+                    .map_err(backend_err_to_status)?;
+                Ok(Response::new(PutResponse {
+                    header: response_header(new_rev),
+                    prev_kv,
+                }))
+            }
+            Err(e) => Err(backend_err_to_status(e)),
+        }
     }
 
     async fn delete_range(
         &self,
-        _request: Request<DeleteRangeRequest>,
+        request: Request<DeleteRangeRequest>,
     ) -> Result<Response<DeleteRangeResponse>, Status> {
-        Err(Status::unimplemented(
-            "direct DeleteRange is not supported; use Txn",
-        ))
+        let req = request.into_inner();
+        let key = String::from_utf8_lossy(&req.key);
+
+        let (rev, kv, ok) = self
+            .backend
+            .delete(&key, 0)
+            .await
+            .map_err(backend_err_to_status)?;
+
+        let deleted = if ok { 1 } else { 0 };
+        let prev_kvs = if req.prev_kv {
+            to_proto_kvs(kv.as_ref())
+        } else {
+            vec![]
+        };
+        Ok(Response::new(DeleteRangeResponse {
+            header: response_header(rev),
+            deleted,
+            prev_kvs,
+        }))
     }
 
     async fn txn(
@@ -467,13 +577,18 @@ impl<B: Backend> Kv for KvBridge<B> {
 
         if let Some(put) = is_create(&txn) {
             let put = put.clone();
-            return Ok(Response::new(self.handle_create(&put).await?));
+            let trailing = extract_trailing_ranges(&txn.success);
+            return Ok(Response::new(
+                self.handle_create(&put, &trailing).await?,
+            ));
         }
         if let Some((rev, key, value, lease)) = is_update(&txn) {
             let key = key.to_vec();
             let value = value.to_vec();
+            let trailing = extract_trailing_ranges(&txn.success);
             return Ok(Response::new(
-                self.handle_update(rev, &key, &value, lease).await?,
+                self.handle_update(rev, &key, &value, lease, &trailing)
+                    .await?,
             ));
         }
         if let Some((rev, key)) = is_delete(&txn) {
