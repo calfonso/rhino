@@ -668,11 +668,15 @@ impl SqliteBackend {
                 config: config.clone(),
             };
 
+            // Capture current revision BEFORE spawning the poll task so that
+            // writes between spawn and the task's first execution are not missed.
+            let poll_start_rev = self.current_rev.load(Ordering::Acquire);
+
             let poll_self = Arc::new(make_backend());
             let compact_self = Arc::new(make_backend());
             let ttl_self = Arc::new(make_backend());
 
-            tokio::spawn(async move { poll_self.poll_loop().await });
+            tokio::spawn(async move { poll_self.poll_loop(poll_start_rev).await });
             tokio::spawn(async move { compact_self.compact_loop().await });
             tokio::spawn(async move { ttl_self.ttl_loop().await });
             debug!("background tasks started (first watch subscription)");
@@ -680,24 +684,23 @@ impl SqliteBackend {
     }
 
     /// Background poll loop: detects new revisions and broadcasts events to watchers.
-    async fn poll_loop(self: Arc<Self>) {
-        let mut poll_revision = match self.db_current_revision().await {
-            Ok(rev) => rev,
-            Err(e) => {
-                error!("poll loop failed to get initial revision: {e}");
-                return;
-            }
-        };
+    /// `start_revision` is captured before the task is spawned to avoid racing
+    /// with writes that happen between spawn and the task's first execution.
+    async fn poll_loop(self: Arc<Self>, start_revision: i64) {
+        let mut poll_revision = start_revision;
 
         let mut interval = tokio::time::interval(POLL_INTERVAL);
         let mut skip: i64 = 0;
         let mut skip_time = tokio::time::Instant::now();
 
         loop {
-            tokio::select! {
-                _ = interval.tick() => {},
-                _ = self.notify.notified() => {},
-            }
+            // Register the notified future BEFORE querying so that any insert()
+            // that calls notify_waiters() between our query and the select! is
+            // captured and not lost. Without this, fast writes can race ahead of
+            // the poll loop and their notifications are missed until the next
+            // interval tick (1s), causing delayed event delivery.
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
 
             // Update polled revision to reflect what rows have been seen.
             // Must happen before querying for new events (matching kine sql.go:504-508).
@@ -707,11 +710,19 @@ impl SqliteBackend {
                 Ok(e) => e,
                 Err(e) => {
                     error!("poll error: {e}");
+                    tokio::select! {
+                        _ = interval.tick() => {},
+                        _ = &mut notified => {},
+                    }
                     continue;
                 }
             };
 
             if events.is_empty() {
+                tokio::select! {
+                    _ = interval.tick() => {},
+                    _ = &mut notified => {},
+                }
                 continue;
             }
 
@@ -1303,6 +1314,10 @@ impl Backend for SqliteBackend {
         let pool = self.pool.clone();
 
         tokio::spawn(async move {
+            // Tracks the highest revision we've delivered, so we can skip
+            // broadcaster events that overlap with the historical query.
+            let mut last_seen_rev = start_rev;
+
             // Fetch historical events
             if start_rev > 0 {
                 let after_prefix = if prefix.ends_with('/') {
@@ -1378,6 +1393,10 @@ impl Backend for SqliteBackend {
                         });
                     }
 
+                    // Track the last revision delivered via historical events so we
+                    // can skip duplicates from the broadcaster below.
+                    last_seen_rev = events.last().map(|e| e.kv.mod_revision).unwrap_or(last_seen_rev);
+
                     if !events.is_empty()
                         && tx.send(events).await.is_err() {
                             return;
@@ -1385,7 +1404,8 @@ impl Backend for SqliteBackend {
                 }
             }
 
-            // Stream live events, filtering by prefix
+            // Stream live events, filtering by prefix and deduplicating
+            // against events already delivered from the historical query.
             let check_prefix = prefix.ends_with('/');
             loop {
                 match broadcast_rx.recv().await {
@@ -1393,11 +1413,12 @@ impl Backend for SqliteBackend {
                         let filtered: Vec<Event> = events
                             .iter()
                             .filter(|e| {
-                                if check_prefix {
-                                    e.kv.key.starts_with(&prefix)
-                                } else {
-                                    e.kv.key == prefix
-                                }
+                                e.kv.mod_revision > last_seen_rev
+                                    && if check_prefix {
+                                        e.kv.key.starts_with(&prefix)
+                                    } else {
+                                        e.kv.key == prefix
+                                    }
                             })
                             .cloned()
                             .collect();
