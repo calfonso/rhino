@@ -66,9 +66,10 @@ impl Broadcaster {
         }
     }
 
-    /// Subscribe to events. Returns a receiver with capacity 100 (matching kine).
+    /// Subscribe to events. Returns a receiver with capacity 1000.
+    /// Large buffer prevents subscriber drops during transient query latency spikes.
     async fn subscribe(&self) -> mpsc::Receiver<Vec<Event>> {
-        let (tx, rx) = mpsc::channel(100);
+        let (tx, rx) = mpsc::channel(1000);
         self.subscribers.lock().await.push(tx);
         rx
     }
@@ -77,7 +78,6 @@ impl Broadcaster {
     async fn send(&self, events: Vec<Event>) {
         let mut subs = self.subscribers.lock().await;
         subs.retain(|tx| {
-            // try_send: if the subscriber's channel is full, drop it
             match tx.try_send(events.clone()) {
                 Ok(()) => true,
                 Err(mpsc::error::TrySendError::Full(_)) => {
@@ -487,13 +487,10 @@ impl SqliteBackend {
         Ok((current_rev, events))
     }
 
-    /// Query rows after a given revision (for poll/watch).
-    async fn after(
-        &self,
-        prefix: &str,
-        revision: i64,
-        limit: i64,
-    ) -> Result<(i64, i64, Vec<Event>)> {
+    /// Query rows after a given revision for the poll loop.
+    /// Uses a simple `id > ?` scan on the primary key — no LIKE filter needed
+    /// since the poll loop processes all keys.
+    async fn after(&self, revision: i64, limit: i64) -> Result<Vec<Event>> {
         let limit_clause = if limit > 0 {
             format!("LIMIT {limit}")
         } else {
@@ -502,8 +499,6 @@ impl SqliteBackend {
 
         let sql = format!(
             "SELECT
-                (SELECT MAX(rkv.id) FROM kine AS rkv),
-                (SELECT MAX(crkv.prev_revision) FROM kine AS crkv WHERE crkv.name = '{COMPACT_REV_KEY}'),
                 kv.id AS theid,
                 kv.name AS thename,
                 kv.created,
@@ -514,33 +509,71 @@ impl SqliteBackend {
                 kv.value,
                 kv.old_value
             FROM kine AS kv
-            WHERE kv.name LIKE ? ESCAPE '^' AND kv.id > ?
+            WHERE kv.id > ?
             ORDER BY kv.id ASC
             {limit_clause}"
         );
 
         let rows = sqlx::query(&sql)
-            .bind(prefix)
             .bind(revision)
             .fetch_all(&self.pool)
             .await
             .map_err(|e| BackendError::Internal(e.to_string()))?;
 
-        let mut current_rev: i64 = 0;
-        let mut compact_rev: i64 = 0;
         let mut events = Vec::with_capacity(rows.len());
 
         for row in &rows {
-            let rev: Option<i64> = row.get(0);
-            let compact: Option<i64> = row.get(1);
-            current_rev = rev.unwrap_or(current_rev);
-            compact_rev = compact.unwrap_or(compact_rev);
-
-            let event = self.row_to_event(row, false, true)?;
+            let event = self.row_to_event_poll(row)?;
             events.push(event);
         }
 
-        Ok((current_rev, compact_rev, events))
+        Ok(events)
+    }
+
+    /// Convert a poll-loop row (no correlated subquery columns) to an Event.
+    fn row_to_event_poll(&self, row: &sqlx::sqlite::SqliteRow) -> Result<Event> {
+        let mod_revision: i64 = row.get(0);
+        let name: String = row.get(1);
+        let created: i32 = row.get(2);
+        let deleted: i32 = row.get(3);
+        let create_revision: i64 = row.get(4);
+        let prev_revision: i64 = row.get(5);
+        let lease: i64 = row.get(6);
+        let value: Vec<u8> = row.try_get::<Vec<u8>, _>(7).unwrap_or_default();
+        let old_value: Vec<u8> = row.try_get::<Vec<u8>, _>(8).unwrap_or_default();
+
+        let is_create = created != 0;
+        let is_delete = deleted != 0;
+        let actual_create_rev = if is_create { mod_revision } else { create_revision };
+
+        let kv = KeyValue {
+            key: name.clone(),
+            value,
+            version: 0,
+            create_revision: actual_create_rev,
+            mod_revision,
+            lease,
+        };
+
+        let prev_kv = if is_create {
+            None
+        } else {
+            Some(KeyValue {
+                key: name,
+                value: old_value,
+                version: 0,
+                create_revision: actual_create_rev,
+                mod_revision: prev_revision,
+                lease,
+            })
+        };
+
+        Ok(Event {
+            create: is_create,
+            delete: is_delete,
+            kv,
+            prev_kv,
+        })
     }
 
     /// Convert a database row to an Event.
@@ -678,8 +711,8 @@ impl SqliteBackend {
             // Must happen before querying for new events (matching kine sql.go:504-508).
             let _ = self.polled_rev.send(poll_revision);
 
-            let (_, _, events) = match self.after("%", poll_revision, 500).await {
-                Ok(r) => r,
+            let events = match self.after(poll_revision, 500).await {
+                Ok(e) => e,
                 Err(e) => {
                     error!("poll error: {e}");
                     continue;
