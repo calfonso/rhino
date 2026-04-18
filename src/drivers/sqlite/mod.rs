@@ -54,7 +54,7 @@ impl Default for SqliteConfig {
 /// Kine-style broadcaster: fans out events to per-subscriber channels.
 /// Slow subscribers are disconnected (channel dropped) rather than lagging.
 struct Broadcaster {
-    subscribers: Mutex<Vec<mpsc::Sender<Vec<Event>>>>,
+    subscribers: Mutex<Vec<mpsc::Sender<Arc<Vec<Event>>>>>,
     started: AtomicBool,
 }
 
@@ -68,17 +68,19 @@ impl Broadcaster {
 
     /// Subscribe to events. Returns a receiver with capacity 1000.
     /// Large buffer prevents subscriber drops during transient query latency spikes.
-    async fn subscribe(&self) -> mpsc::Receiver<Vec<Event>> {
+    async fn subscribe(&self) -> mpsc::Receiver<Arc<Vec<Event>>> {
         let (tx, rx) = mpsc::channel(1000);
         self.subscribers.lock().await.push(tx);
         rx
     }
 
     /// Broadcast events to all subscribers. Slow subscribers (full channel) are dropped.
+    /// Events are wrapped in Arc to avoid cloning per subscriber.
     async fn send(&self, events: Vec<Event>) {
+        let events = Arc::new(events);
         let mut subs = self.subscribers.lock().await;
         subs.retain(|tx| {
-            match tx.try_send(events.clone()) {
+            match tx.try_send(Arc::clone(&events)) {
                 Ok(()) => true,
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     warn!("dropping slow watch subscriber");
@@ -119,9 +121,10 @@ impl SqliteBackend {
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .locking_mode(SqliteLockingMode::Normal)
-            .synchronous(SqliteSynchronous::Full)
+            .synchronous(SqliteSynchronous::Normal)
             .busy_timeout(Duration::from_secs(30))
-            .pragma("cache_size", "-2000")
+            .pragma("cache_size", "-8000")
+            .pragma("mmap_size", "268435456")
             .pragma("auto_vacuum", "incremental")
             .pragma("txlock", "immediate");
 
@@ -349,6 +352,17 @@ impl SqliteBackend {
         include_deleted: bool,
         keys_only: bool,
     ) -> Result<(i64, Vec<Event>)> {
+        // Fetch revision metadata once upfront instead of per-row correlated subqueries.
+        let current_rev = self.cached_revision().await?;
+        let compact_rev = self.get_compact_revision().await?;
+
+        if revision > current_rev {
+            return Err(BackendError::FutureRev);
+        }
+        if revision > 0 && revision < compact_rev {
+            return Err(BackendError::Compacted);
+        }
+
         let value_cols = if keys_only {
             ""
         } else {
@@ -373,8 +387,6 @@ impl SqliteBackend {
 
             let sql = format!(
                 "SELECT
-                    (SELECT MAX(rkv.id) FROM kine AS rkv),
-                    (SELECT MAX(crkv.prev_revision) FROM kine AS crkv WHERE crkv.name = '{COMPACT_REV_KEY}'),
                     kv.id AS theid,
                     kv.name AS thename,
                     kv.created,
@@ -416,8 +428,6 @@ impl SqliteBackend {
 
             let sql = format!(
                 "SELECT
-                    (SELECT MAX(rkv.id) FROM kine AS rkv),
-                    (SELECT MAX(crkv.prev_revision) FROM kine AS crkv WHERE crkv.name = '{COMPACT_REV_KEY}'),
                     kv.id AS theid,
                     kv.name AS thename,
                     kv.created,
@@ -459,29 +469,11 @@ impl SqliteBackend {
         }
         .map_err(|e| BackendError::Internal(e.to_string()))?;
 
-        let mut current_rev: i64 = 0;
-        let mut compact_rev: i64 = 0;
         let mut events = Vec::with_capacity(rows.len());
 
         for row in &rows {
-            let rev: Option<i64> = row.get(0);
-            let compact: Option<i64> = row.get(1);
-            current_rev = rev.unwrap_or(current_rev);
-            compact_rev = compact.unwrap_or(compact_rev);
-
             let event = self.row_to_event(row, keys_only, false)?;
             events.push(event);
-        }
-
-        if current_rev == 0 {
-            current_rev = self.cached_revision().await?;
-        }
-
-        if revision > current_rev {
-            return Err(BackendError::FutureRev);
-        }
-        if revision > 0 && revision < compact_rev {
-            return Err(BackendError::Compacted);
         }
 
         Ok((current_rev, events))
@@ -583,22 +575,22 @@ impl SqliteBackend {
         keys_only: bool,
         with_old_value: bool,
     ) -> Result<Event> {
-        let mod_revision: i64 = row.get(2);
-        let name: String = row.get(3);
-        let created: i32 = row.get(4);
-        let deleted: i32 = row.get(5);
-        let create_revision: i64 = row.get(6);
-        let prev_revision: i64 = row.get(7);
-        let lease: i64 = row.get(8);
+        let mod_revision: i64 = row.get(0);
+        let name: String = row.get(1);
+        let created: i32 = row.get(2);
+        let deleted: i32 = row.get(3);
+        let create_revision: i64 = row.get(4);
+        let prev_revision: i64 = row.get(5);
+        let lease: i64 = row.get(6);
 
         let value: Vec<u8> = if keys_only {
             vec![]
         } else {
-            row.try_get::<Vec<u8>, _>(9).unwrap_or_default()
+            row.try_get::<Vec<u8>, _>(7).unwrap_or_default()
         };
 
         let old_value: Vec<u8> = if !keys_only && with_old_value {
-            row.try_get::<Vec<u8>, _>(10).unwrap_or_default()
+            row.try_get::<Vec<u8>, _>(8).unwrap_or_default()
         } else {
             vec![]
         };
@@ -852,7 +844,7 @@ impl SqliteBackend {
                     match result {
                         Some(events) => {
                             let now = Instant::now();
-                            for event in &events {
+                            for event in events.iter() {
                                 if event.delete {
                                     expiries.remove(&event.kv.key);
                                 } else if event.kv.lease > 0 {
@@ -1159,6 +1151,8 @@ impl Backend for SqliteBackend {
             ""
         };
 
+        let rev = self.cached_revision().await?;
+
         if revision == 0 {
             // Use kine_current for O(keys) count
             let start_where = if effective_start.is_empty() {
@@ -1168,9 +1162,7 @@ impl Backend for SqliteBackend {
             };
 
             let sql = format!(
-                "SELECT
-                    (SELECT MAX(rkv.id) FROM kine AS rkv),
-                    COUNT(*)
+                "SELECT COUNT(*)
                 FROM kine AS kv
                 JOIN kine_current AS cur ON cur.id = kv.id
                 WHERE cur.name LIKE ? ESCAPE '^'
@@ -1179,12 +1171,12 @@ impl Backend for SqliteBackend {
             );
 
             let row = if effective_start.is_empty() {
-                sqlx::query_as::<_, (Option<i64>, i64)>(&sql)
+                sqlx::query_as::<_, (i64,)>(&sql)
                     .bind(&like_prefix)
                     .fetch_one(&self.pool)
                     .await
             } else {
-                sqlx::query_as::<_, (Option<i64>, i64)>(&sql)
+                sqlx::query_as::<_, (i64,)>(&sql)
                     .bind(&like_prefix)
                     .bind(effective_start)
                     .fetch_one(&self.pool)
@@ -1192,9 +1184,7 @@ impl Backend for SqliteBackend {
             }
             .map_err(|e| BackendError::Internal(e.to_string()))?;
 
-            let rev = row.0.unwrap_or(0);
-            let rev = if rev == 0 { self.cached_revision().await? } else { rev };
-            Ok((rev, row.1))
+            Ok((rev, row.0))
         } else {
             // Historical count via GROUP BY subquery
             let start_where = if effective_start.is_empty() {
@@ -1204,9 +1194,7 @@ impl Backend for SqliteBackend {
             };
 
             let sql = format!(
-                "SELECT
-                    (SELECT MAX(rkv.id) FROM kine AS rkv),
-                    COUNT(c.theid)
+                "SELECT COUNT(c.theid)
                 FROM (
                     SELECT kv.id AS theid
                     FROM kine AS kv
@@ -1223,13 +1211,13 @@ impl Backend for SqliteBackend {
             );
 
             let row = if effective_start.is_empty() {
-                sqlx::query_as::<_, (Option<i64>, i64)>(&sql)
+                sqlx::query_as::<_, (i64,)>(&sql)
                     .bind(&like_prefix)
                     .bind(revision)
                     .fetch_one(&self.pool)
                     .await
             } else {
-                sqlx::query_as::<_, (Option<i64>, i64)>(&sql)
+                sqlx::query_as::<_, (i64,)>(&sql)
                     .bind(&like_prefix)
                     .bind(effective_start)
                     .bind(revision)
@@ -1238,9 +1226,7 @@ impl Backend for SqliteBackend {
             }
             .map_err(|e| BackendError::Internal(e.to_string()))?;
 
-            let rev = row.0.unwrap_or(0);
-            let rev = if rev == 0 { self.cached_revision().await? } else { rev };
-            Ok((rev, row.1))
+            Ok((rev, row.0))
         }
     }
 
@@ -1325,10 +1311,8 @@ impl Backend for SqliteBackend {
                     prefix.clone()
                 };
 
-                let sql = format!(
+                let sql =
                     "SELECT
-                        (SELECT MAX(rkv.id) FROM kine AS rkv),
-                        (SELECT MAX(crkv.prev_revision) FROM kine AS crkv WHERE crkv.name = '{COMPACT_REV_KEY}'),
                         kv.id AS theid,
                         kv.name AS thename,
                         kv.created,
@@ -1340,10 +1324,9 @@ impl Backend for SqliteBackend {
                         kv.old_value
                     FROM kine AS kv
                     WHERE kv.name LIKE ? ESCAPE '^' AND kv.id > ?
-                    ORDER BY kv.id ASC"
-                );
+                    ORDER BY kv.id ASC";
 
-                if let Ok(rows) = sqlx::query(&sql)
+                if let Ok(rows) = sqlx::query(sql)
                     .bind(&after_prefix)
                     .bind(start_rev)
                     .fetch_all(&pool)
@@ -1351,15 +1334,15 @@ impl Backend for SqliteBackend {
                 {
                     let mut events = Vec::new();
                     for row in &rows {
-                        let mod_revision: i64 = row.get(2);
-                        let name: String = row.get(3);
-                        let created: i32 = row.get(4);
-                        let deleted: i32 = row.get(5);
-                        let create_revision: i64 = row.get(6);
-                        let prev_revision: i64 = row.get(7);
-                        let lease: i64 = row.get(8);
-                        let value: Vec<u8> = row.try_get(9).unwrap_or_default();
-                        let old_value: Vec<u8> = row.try_get(10).unwrap_or_default();
+                        let mod_revision: i64 = row.get(0);
+                        let name: String = row.get(1);
+                        let created: i32 = row.get(2);
+                        let deleted: i32 = row.get(3);
+                        let create_revision: i64 = row.get(4);
+                        let prev_revision: i64 = row.get(5);
+                        let lease: i64 = row.get(6);
+                        let value: Vec<u8> = row.try_get(7).unwrap_or_default();
+                        let old_value: Vec<u8> = row.try_get(8).unwrap_or_default();
 
                         if name.starts_with("gap-") {
                             continue;
@@ -1408,7 +1391,7 @@ impl Backend for SqliteBackend {
                 match broadcast_rx.recv().await {
                     Some(events) => {
                         let filtered: Vec<Event> = events
-                            .into_iter()
+                            .iter()
                             .filter(|e| {
                                 if check_prefix {
                                     e.kv.key.starts_with(&prefix)
@@ -1416,6 +1399,7 @@ impl Backend for SqliteBackend {
                                     e.kv.key == prefix
                                 }
                             })
+                            .cloned()
                             .collect();
                         if !filtered.is_empty()
                             && tx.send(filtered).await.is_err() {
