@@ -782,6 +782,36 @@ impl Backend for PostgresBackend {
         }
     }
 
+    async fn delete_prefix(&self, prefix: &str) -> Result<(i64, i64, Vec<KeyValue>)> {
+        let like_prefix = format!("{}%", prefix.replace('_', "^_"));
+        let (_, kvs) = self.list(&like_prefix, "", 0, 0, false).await?;
+
+        let mut prev_kvs = Vec::new();
+        let mut last_rev = 0i64;
+
+        for kv in &kvs {
+            match self.delete(&kv.key, 0).await {
+                Ok((rev, prev, true)) => {
+                    last_rev = rev;
+                    if let Some(p) = prev {
+                        prev_kvs.push(p);
+                    }
+                }
+                Ok((rev, _, false)) => {
+                    last_rev = rev;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        if last_rev == 0 {
+            last_rev = self.cached_revision().await?;
+        }
+
+        let deleted = prev_kvs.len() as i64;
+        Ok((last_rev, deleted, prev_kvs))
+    }
+
     async fn list(
         &self,
         prefix: &str,

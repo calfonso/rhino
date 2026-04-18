@@ -1122,6 +1122,57 @@ impl Backend for SqliteBackend {
         }
     }
 
+    async fn delete_prefix(&self, prefix: &str) -> Result<(i64, i64, Vec<KeyValue>)> {
+        let like_prefix = format!("{}%", prefix.replace('_', "^_"));
+
+        // Fetch all live keys matching the prefix
+        let rows = sqlx::query(
+            "SELECT kv.id, kv.name, kv.create_revision, kv.value, kv.lease
+             FROM kine AS kv
+             JOIN kine_current AS cur ON cur.id = kv.id
+             WHERE cur.name LIKE ? ESCAPE '^'
+             AND kv.deleted = 0
+             ORDER BY kv.name ASC",
+        )
+        .bind(&like_prefix)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| BackendError::Internal(e.to_string()))?;
+
+        if rows.is_empty() {
+            let rev = self.cached_revision().await?;
+            return Ok((rev, 0, Vec::new()));
+        }
+
+        let mut prev_kvs = Vec::with_capacity(rows.len());
+        let mut last_rev = 0i64;
+
+        for row in &rows {
+            let id: i64 = row.get(0);
+            let name: String = row.get(1);
+            let create_revision: i64 = row.get(2);
+            let value: Vec<u8> = row.try_get::<Vec<u8>, _>(3).unwrap_or_default();
+            let lease: i64 = row.get(4);
+
+            let new_rev = self
+                .insert(&name, false, true, create_revision, id, 0, &value, &value)
+                .await?;
+            last_rev = new_rev;
+
+            prev_kvs.push(KeyValue {
+                key: name,
+                value,
+                version: 0,
+                create_revision,
+                mod_revision: id,
+                lease,
+            });
+        }
+
+        let deleted = prev_kvs.len() as i64;
+        Ok((last_rev, deleted, prev_kvs))
+    }
+
     async fn list(
         &self,
         prefix: &str,

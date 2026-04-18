@@ -69,6 +69,13 @@ pub trait Backend: Send + Sync + 'static {
         revision: i64,
     ) -> Result<(i64, Option<KeyValue>, bool)>;
 
+    /// Delete all live keys matching a prefix in a single transaction.
+    /// Returns (latest_revision, deleted_count, prev_kvs).
+    async fn delete_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<(i64, i64, Vec<KeyValue>)>;
+
     /// List keys matching prefix. Returns (current_revision, kvs).
     async fn list(
         &self,

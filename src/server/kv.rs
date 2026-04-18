@@ -781,43 +781,17 @@ impl<B: Backend> Kv for KvBridge<B> {
                 s
             };
 
-            // List all live keys matching the prefix
-            let (_, kvs) = self
+            let (last_rev, deleted, backend_prev_kvs) = self
                 .backend
-                .list(&prefix, "", 0, 0, false)
+                .delete_prefix(&prefix)
                 .await
                 .map_err(backend_err_to_status)?;
 
-            let mut deleted = 0i64;
-            let mut prev_kvs = Vec::new();
-            let mut last_rev = 0i64;
-
-            for kv in &kvs {
-                match self.backend.delete(&kv.key, 0).await {
-                    Ok((rev, prev, true)) => {
-                        deleted += 1;
-                        last_rev = rev;
-                        if r.prev_kv {
-                            if let Some(ref p) = prev {
-                                prev_kvs.push(to_proto_kv(p));
-                            }
-                        }
-                    }
-                    Ok((rev, _, false)) => {
-                        // Already deleted or revision mismatch — skip
-                        last_rev = rev;
-                    }
-                    Err(e) => return Err(backend_err_to_status(e)),
-                }
-            }
-
-            if last_rev == 0 {
-                last_rev = self
-                    .backend
-                    .current_revision()
-                    .await
-                    .map_err(backend_err_to_status)?;
-            }
+            let prev_kvs = if r.prev_kv {
+                backend_prev_kvs.iter().map(to_proto_kv).collect()
+            } else {
+                vec![]
+            };
 
             Ok(Response::new(DeleteRangeResponse {
                 header: response_header(last_rev),
