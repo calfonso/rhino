@@ -738,9 +738,93 @@ impl<B: Backend> Kv for KvBridge<B> {
 
     async fn delete_range(
         &self,
-        _request: Request<DeleteRangeRequest>,
+        request: Request<DeleteRangeRequest>,
     ) -> Result<Response<DeleteRangeResponse>, Status> {
-        Err(Status::unimplemented("delete is not implemented"))
+        let r = request.into_inner();
+        let key = String::from_utf8_lossy(&r.key);
+
+        if r.range_end.is_empty() {
+            // Single key delete
+            let (rev, prev_kv, ok) = self
+                .backend
+                .delete(&key, 0)
+                .await
+                .map_err(backend_err_to_status)?;
+
+            let (deleted, prev_kvs) = if ok && prev_kv.is_some() {
+                let pvs = if r.prev_kv {
+                    prev_kv.iter().map(to_proto_kv).collect()
+                } else {
+                    vec![]
+                };
+                (1, pvs)
+            } else {
+                (0, vec![])
+            };
+
+            Ok(Response::new(DeleteRangeResponse {
+                header: response_header(rev),
+                deleted,
+                prev_kvs,
+            }))
+        } else {
+            // Prefix delete: derive prefix from range_end (same logic as handle_list)
+            let prefix = {
+                let mut p = r.range_end.clone();
+                if let Some(last) = p.last_mut() {
+                    *last = last.wrapping_sub(1);
+                }
+                let mut s = String::from_utf8_lossy(&p).to_string();
+                if !s.ends_with('/') {
+                    s.push('/');
+                }
+                s
+            };
+
+            // List all live keys matching the prefix
+            let (_, kvs) = self
+                .backend
+                .list(&prefix, "", 0, 0, false)
+                .await
+                .map_err(backend_err_to_status)?;
+
+            let mut deleted = 0i64;
+            let mut prev_kvs = Vec::new();
+            let mut last_rev = 0i64;
+
+            for kv in &kvs {
+                match self.backend.delete(&kv.key, 0).await {
+                    Ok((rev, prev, true)) => {
+                        deleted += 1;
+                        last_rev = rev;
+                        if r.prev_kv {
+                            if let Some(ref p) = prev {
+                                prev_kvs.push(to_proto_kv(p));
+                            }
+                        }
+                    }
+                    Ok((rev, _, false)) => {
+                        // Already deleted or revision mismatch — skip
+                        last_rev = rev;
+                    }
+                    Err(e) => return Err(backend_err_to_status(e)),
+                }
+            }
+
+            if last_rev == 0 {
+                last_rev = self
+                    .backend
+                    .current_revision()
+                    .await
+                    .map_err(backend_err_to_status)?;
+            }
+
+            Ok(Response::new(DeleteRangeResponse {
+                header: response_header(last_rev),
+                deleted,
+                prev_kvs,
+            }))
+        }
     }
 
     async fn txn(

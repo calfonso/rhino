@@ -105,6 +105,10 @@ pub trait Backend: Send + Sync + 'static {
     /// Return the current revision.
     async fn current_revision(&self) -> Result<i64>;
 
+    /// Block until the poll loop has processed all rows up to (and including) the given revision.
+    /// This ensures that any events at or below `revision` have been broadcast to watchers.
+    async fn wait_for_sync_to(&self, revision: i64);
+
     /// Compact revisions up to the given revision. Returns the compacted revision.
     async fn compact(&self, revision: i64) -> Result<i64>;
 }

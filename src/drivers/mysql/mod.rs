@@ -56,6 +56,8 @@ pub struct MysqlBackend {
     current_rev: AtomicI64,
     notify: Notify,
     broadcast_tx: broadcast::Sender<Vec<Event>>,
+    /// Broadcasts the revision that the poll loop has processed up to.
+    polled_rev: Arc<tokio::sync::watch::Sender<i64>>,
     config: MysqlConfig,
 }
 
@@ -74,12 +76,14 @@ impl MysqlBackend {
             .map_err(|e| BackendError::Internal(format!("failed to connect to database: {e}")))?;
 
         let (broadcast_tx, _) = broadcast::channel(1024);
+        let (polled_rev_tx, _) = tokio::sync::watch::channel(0i64);
 
         Ok(Self {
             pool,
             current_rev: AtomicI64::new(0),
             notify: Notify::new(),
             broadcast_tx,
+            polled_rev: Arc::new(polled_rev_tx),
             config,
         })
     }
@@ -490,6 +494,9 @@ impl MysqlBackend {
                 _ = self.notify.notified() => {},
             }
 
+            // Update polled revision before querying (matching kine sql.go:504-508).
+            let _ = self.polled_rev.send(poll_revision);
+
             let (_, _, events) = match self.after("%", poll_revision, 500).await {
                 Ok(r) => r,
                 Err(e) => {
@@ -691,6 +698,7 @@ impl Backend for MysqlBackend {
             current_rev: AtomicI64::new(self.current_rev.load(Ordering::Acquire)),
             notify: Notify::new(),
             broadcast_tx: self.broadcast_tx.clone(),
+            polled_rev: self.polled_rev.clone(),
             config: self.config.clone(),
         });
 
@@ -699,6 +707,7 @@ impl Backend for MysqlBackend {
             current_rev: AtomicI64::new(0),
             notify: Notify::new(),
             broadcast_tx: self.broadcast_tx.clone(),
+            polled_rev: self.polled_rev.clone(),
             config: self.config.clone(),
         });
 
@@ -1028,6 +1037,15 @@ impl Backend for MysqlBackend {
 
     async fn current_revision(&self) -> Result<i64> {
         self.cached_revision().await
+    }
+
+    async fn wait_for_sync_to(&self, revision: i64) {
+        let mut rx = self.polled_rev.subscribe();
+        while *rx.borrow() < revision {
+            if rx.changed().await.is_err() {
+                break;
+            }
+        }
     }
 
     async fn compact(&self, revision: i64) -> Result<i64> {

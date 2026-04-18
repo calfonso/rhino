@@ -28,6 +28,14 @@ struct Args {
     /// Maximum database connection pool size
     #[arg(long, default_value = "10")]
     max_connections: u32,
+
+    /// Watch progress notify interval in seconds
+    #[arg(long, default_value = "5")]
+    watch_progress_notify_interval: u64,
+
+    /// Emulated etcd version string returned by the Status RPC
+    #[arg(long, default_value = "3.5.13")]
+    emulated_etcd_version: String,
 }
 
 #[tokio::main]
@@ -41,6 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
     let compact_interval = Duration::from_secs(args.compact_interval);
+    let notify_interval = Duration::from_secs(args.watch_progress_notify_interval);
 
     if args.endpoint.starts_with("postgres://") || args.endpoint.starts_with("postgresql://") {
         let config = PostgresConfig {
@@ -51,7 +60,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ..Default::default()
         };
         let backend = PostgresBackend::new(config).await?;
-        RhinoServer::new(backend).serve(&args.listen_address).await
+        RhinoServer::new(backend)
+            .with_notify_interval(notify_interval)
+            .with_emulated_etcd_version(args.emulated_etcd_version.clone())
+            .serve(&args.listen_address)
+            .await
     } else if args.endpoint.starts_with("mysql://") || args.endpoint.starts_with("mariadb://") {
         let config = MysqlConfig {
             dsn: args.endpoint,
@@ -61,7 +74,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ..Default::default()
         };
         let backend = MysqlBackend::new(config).await?;
-        RhinoServer::new(backend).serve(&args.listen_address).await
+        RhinoServer::new(backend)
+            .with_notify_interval(notify_interval)
+            .with_emulated_etcd_version(args.emulated_etcd_version.clone())
+            .serve(&args.listen_address)
+            .await
     } else {
         let config = SqliteConfig {
             dsn: args.endpoint,
@@ -71,6 +88,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ..Default::default()
         };
         let backend = SqliteBackend::new(config).await?;
-        RhinoServer::new(backend).serve(&args.listen_address).await
+        RhinoServer::new(backend)
+            .with_notify_interval(notify_interval)
+            .with_emulated_etcd_version(args.emulated_etcd_version.clone())
+            .serve(&args.listen_address)
+            .await
     }
 }

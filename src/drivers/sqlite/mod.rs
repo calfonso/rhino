@@ -95,6 +95,9 @@ pub struct SqliteBackend {
     current_rev: Arc<AtomicI64>,
     notify: Arc<Notify>,
     broadcaster: Arc<Broadcaster>,
+    /// Broadcasts the revision that the poll loop has processed up to.
+    /// Used by `wait_for_sync_to` to block until watchers are caught up.
+    polled_rev: Arc<tokio::sync::watch::Sender<i64>>,
     config: SqliteConfig,
 }
 
@@ -138,11 +141,14 @@ impl SqliteBackend {
             .await
             .map_err(|e| BackendError::Internal(format!("failed to open database: {e}")))?;
 
+        let (polled_rev_tx, _) = tokio::sync::watch::channel(0i64);
+
         Ok(Self {
             pool,
             current_rev: Arc::new(AtomicI64::new(0)),
             notify: Arc::new(Notify::new()),
             broadcaster: Arc::new(Broadcaster::new()),
+            polled_rev: Arc::new(polled_rev_tx),
             config,
         })
     }
@@ -624,6 +630,7 @@ impl SqliteBackend {
             let current_rev = self.current_rev.clone();
             let notify = self.notify.clone();
             let broadcaster = self.broadcaster.clone();
+            let polled_rev = self.polled_rev.clone();
             let config = self.config.clone();
 
             let make_backend = move || SqliteBackend {
@@ -631,6 +638,7 @@ impl SqliteBackend {
                 current_rev: current_rev.clone(),
                 notify: notify.clone(),
                 broadcaster: broadcaster.clone(),
+                polled_rev: polled_rev.clone(),
                 config: config.clone(),
             };
 
@@ -664,6 +672,10 @@ impl SqliteBackend {
                 _ = interval.tick() => {},
                 _ = self.notify.notified() => {},
             }
+
+            // Update polled revision to reflect what rows have been seen.
+            // Must happen before querying for new events (matching kine sql.go:504-508).
+            let _ = self.polled_rev.send(poll_revision);
 
             let (_, _, events) = match self.after("%", poll_revision, 500).await {
                 Ok(r) => r,
@@ -1396,6 +1408,15 @@ impl Backend for SqliteBackend {
 
     async fn current_revision(&self) -> Result<i64> {
         self.cached_revision().await
+    }
+
+    async fn wait_for_sync_to(&self, revision: i64) {
+        let mut rx = self.polled_rev.subscribe();
+        while *rx.borrow() < revision {
+            if rx.changed().await.is_err() {
+                break; // Sender dropped (shutdown)
+            }
+        }
     }
 
     async fn compact(&self, revision: i64) -> Result<i64> {

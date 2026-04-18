@@ -6,8 +6,6 @@ use crate::proto::etcdserverpb::maintenance_server::Maintenance;
 
 use super::KvBridge;
 
-const EMULATED_VERSION: &str = "3.5.13";
-
 fn backend_err_to_status(e: BackendError) -> Status {
     Status::internal(e.to_string())
 }
@@ -33,7 +31,7 @@ impl<B: Backend> Maintenance for KvBridge<B> {
 
         Ok(Response::new(StatusResponse {
             header: Some(ResponseHeader::default()),
-            version: EMULATED_VERSION.to_string(),
+            version: self.emulated_etcd_version.clone(),
             db_size,
             ..Default::default()
         }))
