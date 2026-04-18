@@ -34,7 +34,8 @@ pub struct SqliteConfig {
     pub compact_min_retain: i64,
     /// Max revisions to compact per transaction batch.
     pub compact_batch_size: i64,
-    /// Maximum number of connections in the pool. Defaults to 20.
+    /// Maximum number of connections in the pool. Defaults to 5.
+    /// SQLite serializes writes, so large pools just increase lock contention.
     pub max_connections: u32,
 }
 
@@ -45,7 +46,7 @@ impl Default for SqliteConfig {
             compact_interval: COMPACT_INTERVAL,
             compact_min_retain: COMPACT_MIN_RETAIN,
             compact_batch_size: COMPACT_BATCH_SIZE,
-            max_connections: 10,
+            max_connections: 5,
         }
     }
 }
@@ -867,10 +868,16 @@ impl SqliteBackend {
         loop {
             interval.tick().await;
 
-            if let Err(e) = self.compact_once().await
-                && !matches!(e, BackendError::Compacted) {
+            match self.compact_once().await {
+                Ok(()) => {}
+                Err(BackendError::Compacted) => {}
+                Err(ref e) if e.to_string().contains("database is locked") => {
+                    warn!("compaction deferred due to database contention, will retry next cycle");
+                }
+                Err(e) => {
                     error!("compaction error: {e}");
                 }
+            }
         }
     }
 
