@@ -1,11 +1,11 @@
 use rhino::{Backend, BackendError, RedisBackend, RedisConfig};
 use std::time::Duration;
 
-/// These tests require a running Redis instance at localhost:6379.
-/// Each test uses a unique key prefix via FLUSHDB to avoid cross-test interference.
-/// Run with: cargo test --test redis_backend -- --test-threads=1
-///
-/// To skip these tests when no Redis is available, set SKIP_REDIS_TESTS=1.
+// These tests require a running Redis instance at localhost:6379.
+// Each test uses a unique key prefix via FLUSHDB to avoid cross-test interference.
+// Run with: cargo test --test redis_backend -- --test-threads=1
+//
+// To skip these tests when no Redis is available, set SKIP_REDIS_TESTS=1.
 
 async fn test_backend() -> Option<RedisBackend> {
     if std::env::var("SKIP_REDIS_TESTS").is_ok() {
@@ -399,7 +399,10 @@ async fn test_watch_live_create_update_delete() {
         all_events.len()
     );
     assert!(all_events[0].create, "first event should be create");
-    assert!(!all_events[1].create && !all_events[1].delete, "second event should be update");
+    assert!(
+        !all_events[1].create && !all_events[1].delete,
+        "second event should be update"
+    );
     assert!(all_events[2].delete, "third event should be delete");
 }
 

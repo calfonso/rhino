@@ -21,14 +21,14 @@
 //! in Redis Cluster. The trade-off is that all data lands on one shard — this
 //! backend does not distribute load across cluster nodes.
 
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, Client, Script};
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{Mutex, Notify, mpsc};
 use tracing::{debug, error, trace, warn};
 
 use crate::backend::{Backend, BackendError, Event, KeyValue, Result, WatchResult};
@@ -679,11 +679,7 @@ impl RedisBackend {
             row.create_revision
         };
 
-        let value = if keys_only {
-            vec![]
-        } else {
-            row.value.clone()
-        };
+        let value = if keys_only { vec![] } else { row.value.clone() };
 
         let old_value = if !keys_only && with_old_value {
             row.old_value.clone()
@@ -883,16 +879,14 @@ impl RedisBackend {
 
         let mut events = Vec::new();
 
-        for row_opt in rows {
-            if let Some(row) = row_opt {
-                if !include_deleted && row.deleted != 0 {
-                    continue;
-                }
-                events.push(Self::row_to_event(&row, keys_only, false));
+        for row in rows.into_iter().flatten() {
+            if !include_deleted && row.deleted != 0 {
+                continue;
+            }
+            events.push(Self::row_to_event(&row, keys_only, false));
 
-                if limit > 0 && events.len() as i64 >= limit {
-                    break;
-                }
+            if limit > 0 && events.len() as i64 >= limit {
+                break;
             }
         }
 
@@ -904,9 +898,7 @@ impl RedisBackend {
         let mut conn = self.conn.clone();
 
         let mut cmd = redis::cmd("ZRANGEBYSCORE");
-        cmd.arg(LOG_KEY)
-            .arg(format!("({revision}"))
-            .arg("+inf");
+        cmd.arg(LOG_KEY).arg(format!("({revision}")).arg("+inf");
         if limit > 0 {
             cmd.arg("LIMIT").arg(0).arg(limit);
         }
@@ -919,10 +911,8 @@ impl RedisBackend {
         let rows = self.get_rows_pipelined(&rev_ids).await?;
 
         let mut events = Vec::with_capacity(rev_ids.len());
-        for row_opt in rows {
-            if let Some(row) = row_opt {
-                events.push(Self::row_to_event(&row, false, true));
-            }
+        for row in rows.into_iter().flatten() {
+            events.push(Self::row_to_event(&row, false, true));
         }
 
         Ok(events)
@@ -1096,13 +1086,14 @@ impl RedisBackend {
         let rev_ids: Vec<i64> = pairs.iter().map(|(_, r)| *r).collect();
         if let Ok(rows) = self.get_rows_pipelined(&rev_ids).await {
             for ((name, _), row_opt) in pairs.iter().zip(rows) {
-                if let Some(row) = row_opt {
-                    if row.lease > 0 && row.deleted == 0 {
-                        expiries.insert(
-                            name.clone(),
-                            (row.id, now + Duration::from_secs(row.lease as u64)),
-                        );
-                    }
+                if let Some(row) = row_opt
+                    && row.lease > 0
+                    && row.deleted == 0
+                {
+                    expiries.insert(
+                        name.clone(),
+                        (row.id, now + Duration::from_secs(row.lease as u64)),
+                    );
                 }
             }
         }
@@ -1168,25 +1159,23 @@ impl RedisBackend {
             .unwrap_or(redis::Value::Array(vec![]));
 
         let kv_pairs: Vec<(String, String)> = match data {
-            redis::Value::Map(pairs) => {
-                pairs
-                    .into_iter()
-                    .filter_map(|(k, v)| {
-                        let ks = match k {
-                            redis::Value::BulkString(b) => String::from_utf8_lossy(&b).to_string(),
-                            redis::Value::SimpleString(s) => s,
-                            _ => return None,
-                        };
-                        let vs = match v {
-                            redis::Value::BulkString(b) => String::from_utf8_lossy(&b).to_string(),
-                            redis::Value::SimpleString(s) => s,
-                            redis::Value::Int(n) => n.to_string(),
-                            _ => return None,
-                        };
-                        Some((ks, vs))
-                    })
-                    .collect()
-            }
+            redis::Value::Map(pairs) => pairs
+                .into_iter()
+                .filter_map(|(k, v)| {
+                    let ks = match k {
+                        redis::Value::BulkString(b) => String::from_utf8_lossy(&b).to_string(),
+                        redis::Value::SimpleString(s) => s,
+                        _ => return None,
+                    };
+                    let vs = match v {
+                        redis::Value::BulkString(b) => String::from_utf8_lossy(&b).to_string(),
+                        redis::Value::SimpleString(s) => s,
+                        redis::Value::Int(n) => n.to_string(),
+                        _ => return None,
+                    };
+                    Some((ks, vs))
+                })
+                .collect(),
             redis::Value::Array(arr) => {
                 let mut result = Vec::new();
                 let mut i = 0;
@@ -1619,7 +1608,9 @@ impl Backend for RedisBackend {
         keys_only: bool,
     ) -> Result<(i64, Vec<KeyValue>)> {
         if !prefix.ends_with('/') {
-            let (rev, event) = self.get_internal(prefix, revision, false, keys_only).await?;
+            let (rev, event) = self
+                .get_internal(prefix, revision, false, keys_only)
+                .await?;
             let kvs = event.map(|e| vec![e.kv]).unwrap_or_default();
             return Ok((rev, kvs));
         }
@@ -1748,29 +1739,29 @@ impl Backend for RedisBackend {
             let mut last_seen_rev = start_rev;
 
             // Fetch historical events since the requested revision
-            if start_rev > 0 {
-                if let Ok(events) = backend.after(start_rev, 0).await {
-                    let check_prefix = prefix.ends_with('/');
-                    let filtered: Vec<Event> = events
-                        .into_iter()
-                        .filter(|e| {
-                            !e.kv.key.starts_with("gap-")
-                                && if check_prefix {
-                                    e.kv.key.starts_with(&prefix)
-                                } else {
-                                    e.kv.key == prefix
-                                }
-                        })
-                        .collect();
+            if start_rev > 0
+                && let Ok(events) = backend.after(start_rev, 0).await
+            {
+                let check_prefix = prefix.ends_with('/');
+                let filtered: Vec<Event> = events
+                    .into_iter()
+                    .filter(|e| {
+                        !e.kv.key.starts_with("gap-")
+                            && if check_prefix {
+                                e.kv.key.starts_with(&prefix)
+                            } else {
+                                e.kv.key == prefix
+                            }
+                    })
+                    .collect();
 
-                    last_seen_rev = filtered
-                        .last()
-                        .map(|e| e.kv.mod_revision)
-                        .unwrap_or(last_seen_rev);
+                last_seen_rev = filtered
+                    .last()
+                    .map(|e| e.kv.mod_revision)
+                    .unwrap_or(last_seen_rev);
 
-                    if !filtered.is_empty() && tx.send(filtered).await.is_err() {
-                        return;
-                    }
+                if !filtered.is_empty() && tx.send(filtered).await.is_err() {
+                    return;
                 }
             }
 
