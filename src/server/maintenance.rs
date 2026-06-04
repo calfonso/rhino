@@ -1,8 +1,8 @@
 use tonic::{Request, Response, Status};
 
 use crate::backend::{Backend, BackendError};
-use crate::proto::etcdserverpb::*;
 use crate::proto::etcdserverpb::maintenance_server::Maintenance;
+use crate::proto::etcdserverpb::*;
 
 use super::KvBridge;
 
@@ -44,10 +44,7 @@ impl<B: Backend> Maintenance for KvBridge<B> {
         Err(Status::unknown("defragment is not supported"))
     }
 
-    async fn hash(
-        &self,
-        _request: Request<HashRequest>,
-    ) -> Result<Response<HashResponse>, Status> {
+    async fn hash(&self, _request: Request<HashRequest>) -> Result<Response<HashResponse>, Status> {
         Err(Status::unknown("hash is not supported"))
     }
 
@@ -58,8 +55,9 @@ impl<B: Backend> Maintenance for KvBridge<B> {
         Err(Status::unknown("hash kv is not supported"))
     }
 
-    type SnapshotStream =
-        std::pin::Pin<Box<dyn futures_core::Stream<Item = Result<SnapshotResponse, Status>> + Send>>;
+    type SnapshotStream = std::pin::Pin<
+        Box<dyn futures_core::Stream<Item = Result<SnapshotResponse, Status>> + Send>,
+    >;
 
     async fn snapshot(
         &self,

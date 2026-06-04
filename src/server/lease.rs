@@ -3,8 +3,8 @@ use tokio_stream::Stream;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::backend::Backend;
-use crate::proto::etcdserverpb::*;
 use crate::proto::etcdserverpb::lease_server::Lease;
+use crate::proto::etcdserverpb::*;
 
 use super::KvBridge;
 

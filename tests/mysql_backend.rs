@@ -116,10 +116,7 @@ async fn test_backend_get() {
     assert!(rev > base_rev);
     assert_eq!(ent.value, b"d");
 
-    let (_, ent) = b
-        .get("/test/doesnotexist", "", 0, 0, false)
-        .await
-        .unwrap();
+    let (_, ent) = b.get("/test/doesnotexist", "", 0, 0, false).await.unwrap();
     assert!(ent.is_none());
 }
 
@@ -209,10 +206,7 @@ async fn test_backend_list() {
     assert_eq!(ents.len(), 7);
     assert_keys_sorted(&ents);
 
-    let (_, ents) = b
-        .list("/test/", "", 0, base_rev + 3, false)
-        .await
-        .unwrap();
+    let (_, ents) = b.list("/test/", "", 0, base_rev + 3, false).await.unwrap();
     assert_eq!(ents.len(), 3);
     assert_keys_sorted(&ents);
     assert_eq_keys(&["/test/a", "/test/a/b/c", "/test/b"], &ents);

@@ -5,14 +5,14 @@
 //! for revision IDs, `LAST_INSERT_ID()` for inserts, and `INNER JOIN`
 //! for compaction deletes.
 
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlPoolOptions};
 use sqlx::Row;
-use tokio::sync::{broadcast, mpsc, Notify};
+use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlPoolOptions};
+use tokio::sync::{Notify, broadcast, mpsc};
 use tracing::{debug, error, trace, warn};
 
 use crate::backend::{Backend, BackendError, Event, KeyValue, Result, WatchResult};
@@ -431,7 +431,11 @@ impl MysqlBackend {
 
         let is_create = created != 0;
         let is_delete = deleted != 0;
-        let actual_create_rev = if is_create { mod_revision } else { create_revision };
+        let actual_create_rev = if is_create {
+            mod_revision
+        } else {
+            create_revision
+        };
 
         let kv = KeyValue {
             key: name.clone(),
@@ -739,10 +743,7 @@ impl Backend for MysqlBackend {
             return Err(BackendError::KeyExists);
         }
 
-        let prev_revision = existing
-            .as_ref()
-            .map(|e| e.kv.mod_revision)
-            .unwrap_or(0);
+        let prev_revision = existing.as_ref().map(|e| e.kv.mod_revision).unwrap_or(0);
 
         let old_value = existing
             .as_ref()
@@ -983,8 +984,11 @@ impl Backend for MysqlBackend {
 
                         let is_create = created != 0;
                         let is_delete = deleted != 0;
-                        let actual_create_rev =
-                            if is_create { mod_revision } else { create_revision };
+                        let actual_create_rev = if is_create {
+                            mod_revision
+                        } else {
+                            create_revision
+                        };
 
                         events.push(Event {
                             create: is_create,

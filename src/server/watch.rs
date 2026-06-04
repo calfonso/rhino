@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -10,8 +10,8 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{error, trace};
 
 use crate::backend::{Backend, BackendError};
-use crate::proto::etcdserverpb::*;
 use crate::proto::etcdserverpb::watch_server::Watch;
+use crate::proto::etcdserverpb::*;
 use crate::proto::mvccpb;
 
 use super::KvBridge;
@@ -216,14 +216,18 @@ impl<B: Backend> Watch for KvBridge<B> {
                     Some(watch_request::RequestUnion::CreateRequest(create)) => {
                         // Reject client-provided watch IDs (kine only accepts AutoWatchID = 0)
                         if create.watch_id != 0 {
-                            let _ = resp_tx.send(Ok(WatchResponse {
-                                header: Some(ResponseHeader::default()),
-                                watch_id: -1, // InvalidWatchID
-                                created: true,
-                                canceled: true,
-                                cancel_reason: "etcdserver: unsupported options in watch request".to_string(),
-                                ..Default::default()
-                            })).await;
+                            let _ = resp_tx
+                                .send(Ok(WatchResponse {
+                                    header: Some(ResponseHeader::default()),
+                                    watch_id: -1, // InvalidWatchID
+                                    created: true,
+                                    canceled: true,
+                                    cancel_reason:
+                                        "etcdserver: unsupported options in watch request"
+                                            .to_string(),
+                                    ..Default::default()
+                                }))
+                                .await;
                             continue;
                         }
 
@@ -239,14 +243,16 @@ impl<B: Backend> Watch for KvBridge<B> {
 
                         // Reject negative start revision (kine sends ErrCompacted)
                         if start_revision < 0 {
-                            let _ = resp_tx.send(Ok(WatchResponse {
-                                header: Some(ResponseHeader::default()),
-                                watch_id,
-                                canceled: true,
-                                compact_revision: start_revision,
-                                cancel_reason: "compacted".to_string(),
-                                ..Default::default()
-                            })).await;
+                            let _ = resp_tx
+                                .send(Ok(WatchResponse {
+                                    header: Some(ResponseHeader::default()),
+                                    watch_id,
+                                    canceled: true,
+                                    compact_revision: start_revision,
+                                    cancel_reason: "compacted".to_string(),
+                                    ..Default::default()
+                                }))
+                                .await;
                             continue;
                         }
 
@@ -265,12 +271,14 @@ impl<B: Backend> Watch for KvBridge<B> {
                         state.lock().await.cancels.insert(watch_id, cancel_tx);
 
                         // Send created confirmation
-                        let _ = resp_tx.send(Ok(WatchResponse {
-                            header: Some(ResponseHeader::default()),
-                            watch_id,
-                            created: true,
-                            ..Default::default()
-                        })).await;
+                        let _ = resp_tx
+                            .send(Ok(WatchResponse {
+                                header: Some(ResponseHeader::default()),
+                                watch_id,
+                                created: true,
+                                ..Default::default()
+                            }))
+                            .await;
 
                         // Spawn an independent task for this watch
                         let backend = backend.clone();
@@ -287,17 +295,19 @@ impl<B: Backend> Watch for KvBridge<B> {
                                         && start_revision > 0
                                         && start_revision <= wr.compact_revision
                                     {
-                                        let _ = resp_tx.send(Ok(WatchResponse {
-                                            header: Some(ResponseHeader {
-                                                revision: wr.current_revision,
+                                        let _ = resp_tx
+                                            .send(Ok(WatchResponse {
+                                                header: Some(ResponseHeader {
+                                                    revision: wr.current_revision,
+                                                    ..Default::default()
+                                                }),
+                                                watch_id,
+                                                canceled: true,
+                                                compact_revision: wr.compact_revision,
+                                                cancel_reason: "compacted".to_string(),
                                                 ..Default::default()
-                                            }),
-                                            watch_id,
-                                            canceled: true,
-                                            compact_revision: wr.compact_revision,
-                                            cancel_reason: "compacted".to_string(),
-                                            ..Default::default()
-                                        })).await;
+                                            }))
+                                            .await;
                                         return;
                                     }
                                     wr
@@ -305,17 +315,19 @@ impl<B: Backend> Watch for KvBridge<B> {
                                 Err(BackendError::Compacted) => {
                                     // Backend returned compacted error — get actual revisions
                                     let current_rev = backend.current_revision().await.unwrap_or(0);
-                                    let _ = resp_tx.send(Ok(WatchResponse {
-                                        header: Some(ResponseHeader {
-                                            revision: current_rev,
+                                    let _ = resp_tx
+                                        .send(Ok(WatchResponse {
+                                            header: Some(ResponseHeader {
+                                                revision: current_rev,
+                                                ..Default::default()
+                                            }),
+                                            watch_id,
+                                            canceled: true,
+                                            compact_revision: start_revision,
+                                            cancel_reason: "compacted".to_string(),
                                             ..Default::default()
-                                        }),
-                                        watch_id,
-                                        canceled: true,
-                                        compact_revision: start_revision,
-                                        cancel_reason: "compacted".to_string(),
-                                        ..Default::default()
-                                    })).await;
+                                        }))
+                                        .await;
                                     return;
                                 }
                                 Err(e) => {
@@ -432,13 +444,15 @@ impl<B: Backend> Watch for KvBridge<B> {
                         s.progress.remove(&cancel.watch_id);
                         drop(s);
 
-                        let _ = resp_tx.send(Ok(WatchResponse {
-                            header: Some(ResponseHeader::default()),
-                            watch_id: cancel.watch_id,
-                            canceled: true,
-                            cancel_reason: "watch cancelled by client".to_string(),
-                            ..Default::default()
-                        })).await;
+                        let _ = resp_tx
+                            .send(Ok(WatchResponse {
+                                header: Some(ResponseHeader::default()),
+                                watch_id: cancel.watch_id,
+                                canceled: true,
+                                cancel_reason: "watch cancelled by client".to_string(),
+                                ..Default::default()
+                            }))
+                            .await;
                     }
                     Some(watch_request::RequestUnion::ProgressRequest(_)) => {
                         // Set flag for ProgressAll background task to handle.

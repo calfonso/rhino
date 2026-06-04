@@ -6,7 +6,10 @@ use rhino::{
 use std::time::Duration;
 
 #[derive(Parser)]
-#[command(name = "rhino-server", about = "etcd-compatible gRPC server backed by SQL")]
+#[command(
+    name = "rhino-server",
+    about = "etcd-compatible gRPC server backed by SQL"
+)]
 struct Args {
     /// gRPC listen address
     #[arg(long, default_value = "0.0.0.0:2379")]

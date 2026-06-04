@@ -1,8 +1,8 @@
 use tonic::{Request, Response, Status};
 
 use crate::backend::{Backend, BackendError, KeyValue as BackendKv};
-use crate::proto::etcdserverpb::*;
 use crate::proto::etcdserverpb::kv_server::Kv;
+use crate::proto::etcdserverpb::*;
 use crate::proto::mvccpb;
 
 use super::KvBridge;
@@ -118,20 +118,16 @@ fn is_update(txn: &TxnRequest) -> Option<(i64, &[u8], &[u8], i64)> {
 /// 2) Compare: MOD == rev, success = [DeleteRange], failure = [Range]
 fn is_delete(txn: &TxnRequest) -> Option<(i64, &[u8])> {
     // Form 1: unconditional delete
-    if txn.compare.is_empty()
-        && txn.failure.is_empty()
-        && txn.success.len() == 2
-    {
-        let is_range = txn.success[0].request.as_ref().is_some_and(|r| {
-            matches!(r, request_op::Request::RequestRange(_))
-        });
+    if txn.compare.is_empty() && txn.failure.is_empty() && txn.success.len() == 2 {
+        let is_range = txn.success[0]
+            .request
+            .as_ref()
+            .is_some_and(|r| matches!(r, request_op::Request::RequestRange(_)));
         let del = txn.success[1].request.as_ref().and_then(|r| match r {
             request_op::Request::RequestDeleteRange(del) => Some(del),
             _ => None,
         });
-        if is_range
-            && let Some(del) = del
-        {
+        if is_range && let Some(del) = del {
             return Some((0, &del.key));
         }
     }
@@ -194,7 +190,11 @@ fn redirect_key(key: &str) -> &str {
 
 /// Encode a version + value for compact_rev_key storage.
 fn encode_version(version: i64, value: &[u8]) -> Vec<u8> {
-    format!("{}|", version).into_bytes().into_iter().chain(value.iter().copied()).collect()
+    format!("{}|", version)
+        .into_bytes()
+        .into_iter()
+        .chain(value.iter().copied())
+        .collect()
 }
 
 /// Decode a version + value from compact_rev_key storage.
@@ -245,10 +245,7 @@ fn extract_trailing_ranges(success: &[RequestOp]) -> Vec<RangeRequest> {
 }
 
 impl<B: Backend> KvBridge<B> {
-    async fn handle_range(
-        &self,
-        r: &RangeRequest,
-    ) -> Result<RangeResponse, Status> {
+    async fn handle_range(&self, r: &RangeRequest) -> Result<RangeResponse, Status> {
         if r.range_end.is_empty() {
             self.handle_get(r).await
         } else {
@@ -256,10 +253,7 @@ impl<B: Backend> KvBridge<B> {
         }
     }
 
-    async fn handle_get(
-        &self,
-        r: &RangeRequest,
-    ) -> Result<RangeResponse, Status> {
+    async fn handle_get(&self, r: &RangeRequest) -> Result<RangeResponse, Status> {
         let raw_key = String::from_utf8_lossy(&r.key);
         let key = redirect_key(&raw_key);
         let range_end = String::from_utf8_lossy(&r.range_end);
@@ -272,14 +266,16 @@ impl<B: Backend> KvBridge<B> {
 
         let kvs = if key != raw_key.as_ref() {
             // Redirected key — rewrite key and decode version in response
-            kv.as_ref().map(|kv| {
-                let (version, value) = decode_version(&kv.value);
-                let mut proto = to_proto_kv(kv);
-                proto.key = raw_key.as_bytes().to_vec();
-                proto.value = value;
-                proto.version = version;
-                vec![proto]
-            }).unwrap_or_default()
+            kv.as_ref()
+                .map(|kv| {
+                    let (version, value) = decode_version(&kv.value);
+                    let mut proto = to_proto_kv(kv);
+                    proto.key = raw_key.as_bytes().to_vec();
+                    proto.value = value;
+                    proto.version = version;
+                    vec![proto]
+                })
+                .unwrap_or_default()
         } else {
             to_proto_kvs(kv.as_ref())
         };
@@ -292,10 +288,7 @@ impl<B: Backend> KvBridge<B> {
         })
     }
 
-    async fn handle_list(
-        &self,
-        r: &RangeRequest,
-    ) -> Result<RangeResponse, Status> {
+    async fn handle_list(&self, r: &RangeRequest) -> Result<RangeResponse, Status> {
         let range_end = &r.range_end;
         let prefix = {
             let mut p = range_end.clone();
@@ -425,12 +418,10 @@ impl<B: Backend> KvBridge<B> {
             match self.backend.create(&key_str, value, lease).await {
                 Ok(new_rev) => {
                     let mut responses = vec![ResponseOp {
-                        response: Some(response_op::Response::ResponsePut(
-                            PutResponse {
-                                header: response_header(new_rev),
-                                prev_kv: None,
-                            },
-                        )),
+                        response: Some(response_op::Response::ResponsePut(PutResponse {
+                            header: response_header(new_rev),
+                            prev_kv: None,
+                        })),
                     }];
                     for r in trailing_ranges {
                         let range_resp = self.handle_range(r).await?;
@@ -456,14 +447,12 @@ impl<B: Backend> KvBridge<B> {
                         header: response_header(current_rev),
                         succeeded: false,
                         responses: vec![ResponseOp {
-                            response: Some(response_op::Response::ResponseRange(
-                                RangeResponse {
-                                    header: response_header(current_rev),
-                                    kvs,
-                                    count: 1,
-                                    more: false,
-                                },
-                            )),
+                            response: Some(response_op::Response::ResponseRange(RangeResponse {
+                                header: response_header(current_rev),
+                                kvs,
+                                count: 1,
+                                more: false,
+                            })),
                         }],
                     });
                 }
@@ -502,14 +491,12 @@ impl<B: Backend> KvBridge<B> {
                 header: response_header(new_rev),
                 succeeded: false,
                 responses: vec![ResponseOp {
-                    response: Some(response_op::Response::ResponseRange(
-                        RangeResponse {
-                            header: response_header(new_rev),
-                            kvs,
-                            count,
-                            more: false,
-                        },
-                    )),
+                    response: Some(response_op::Response::ResponseRange(RangeResponse {
+                        header: response_header(new_rev),
+                        kvs,
+                        count,
+                        more: false,
+                    })),
                 }],
             })
         }
@@ -547,10 +534,16 @@ impl<B: Backend> KvBridge<B> {
                     Ok(rev) => rev,
                     Err(BackendError::KeyExists) => {
                         // Race: someone else created it. Get and update.
-                        let (_, kv) = self.backend.get(key, "", 1, 0, false).await
+                        let (_, kv) = self
+                            .backend
+                            .get(key, "", 1, 0, false)
+                            .await
                             .map_err(backend_err_to_status)?;
                         let mod_rev = kv.as_ref().map(|k| k.mod_revision).unwrap_or(0);
-                        let (rev, _, _) = self.backend.update(key, &encoded, mod_rev, 0).await
+                        let (rev, _, _) = self
+                            .backend
+                            .update(key, &encoded, mod_rev, 0)
+                            .await
                             .map_err(backend_err_to_status)?;
                         rev
                     }
@@ -589,24 +582,18 @@ impl<B: Backend> KvBridge<B> {
                 header: response_header(current_rev),
                 succeeded: false,
                 responses: vec![ResponseOp {
-                    response: Some(response_op::Response::ResponseRange(
-                        RangeResponse {
-                            header: Some(ResponseHeader::default()),
-                            kvs,
-                            count: 1,
-                            more: false,
-                        },
-                    )),
+                    response: Some(response_op::Response::ResponseRange(RangeResponse {
+                        header: Some(ResponseHeader::default()),
+                        kvs,
+                        count: 1,
+                        more: false,
+                    })),
                 }],
             })
         }
     }
 
-    async fn handle_delete(
-        &self,
-        key: &[u8],
-        revision: i64,
-    ) -> Result<TxnResponse, Status> {
+    async fn handle_delete(&self, key: &[u8], revision: i64) -> Result<TxnResponse, Status> {
         let key_str = String::from_utf8_lossy(key);
 
         let (rev, kv, ok) = self
@@ -637,14 +624,12 @@ impl<B: Backend> KvBridge<B> {
                 header: response_header(rev),
                 succeeded: false,
                 responses: vec![ResponseOp {
-                    response: Some(response_op::Response::ResponseRange(
-                        RangeResponse {
-                            header: response_header(rev),
-                            kvs,
-                            count,
-                            more: false,
-                        },
-                    )),
+                    response: Some(response_op::Response::ResponseRange(RangeResponse {
+                        header: response_header(rev),
+                        kvs,
+                        count,
+                        more: false,
+                    })),
                 }],
             })
         }
@@ -661,7 +646,9 @@ impl<B: Backend> Kv for KvBridge<B> {
 
         // Reject unsupported Range options (matching kine)
         if r.max_create_revision != 0 {
-            return Err(Status::unimplemented("maxCreateRevision is not implemented"));
+            return Err(Status::unimplemented(
+                "maxCreateRevision is not implemented",
+            ));
         }
         if r.sort_order != 0 {
             return Err(Status::unimplemented("sortOrder is not implemented"));
@@ -676,7 +663,9 @@ impl<B: Backend> Kv for KvBridge<B> {
             return Err(Status::unimplemented("minModRevision is not implemented"));
         }
         if r.min_create_revision != 0 {
-            return Err(Status::unimplemented("minCreateRevision is not implemented"));
+            return Err(Status::unimplemented(
+                "minCreateRevision is not implemented",
+            ));
         }
         if r.max_mod_revision != 0 {
             return Err(Status::unimplemented("maxModRevision is not implemented"));
@@ -686,10 +675,7 @@ impl<B: Backend> Kv for KvBridge<B> {
         Ok(Response::new(resp))
     }
 
-    async fn put(
-        &self,
-        request: Request<PutRequest>,
-    ) -> Result<Response<PutResponse>, Status> {
+    async fn put(&self, request: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
         let put = request.into_inner();
 
         // Reject unsupported Put options (matching kine)
@@ -801,18 +787,13 @@ impl<B: Backend> Kv for KvBridge<B> {
         }
     }
 
-    async fn txn(
-        &self,
-        request: Request<TxnRequest>,
-    ) -> Result<Response<TxnResponse>, Status> {
+    async fn txn(&self, request: Request<TxnRequest>) -> Result<Response<TxnResponse>, Status> {
         let txn = request.into_inner();
 
         if let Some(put) = is_create(&txn) {
             let put = put.clone();
             let trailing = extract_trailing_ranges(&txn.success);
-            return Ok(Response::new(
-                self.handle_create(&put, &trailing).await?,
-            ));
+            return Ok(Response::new(self.handle_create(&put, &trailing).await?));
         }
         if let Some((rev, key, value, lease)) = is_update(&txn) {
             let key = key.to_vec();

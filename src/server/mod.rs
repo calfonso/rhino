@@ -1,8 +1,8 @@
+mod cluster;
 mod kv;
-mod watch;
 mod lease;
 mod maintenance;
-mod cluster;
+mod watch;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,8 +11,8 @@ use tracing::info;
 
 use crate::backend::Backend;
 use crate::proto::etcdserverpb::{
-    kv_server::KvServer, watch_server::WatchServer, lease_server::LeaseServer,
-    maintenance_server::MaintenanceServer, cluster_server::ClusterServer,
+    cluster_server::ClusterServer, kv_server::KvServer, lease_server::LeaseServer,
+    maintenance_server::MaintenanceServer, watch_server::WatchServer,
 };
 
 /// Default watch progress notify interval (matching kine's default).
@@ -53,9 +53,10 @@ impl<B: Backend> RhinoServer<B> {
     pub async fn serve(self, addr: &str) -> Result<(), Box<dyn std::error::Error>> {
         let addr = addr.parse()?;
 
-        self.backend.start().await.map_err(|e| {
-            Box::new(e) as Box<dyn std::error::Error>
-        })?;
+        self.backend
+            .start()
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
 
         let bridge = KvBridge::new(
             self.backend.clone(),
@@ -102,6 +103,10 @@ impl<B: Backend> Clone for KvBridge<B> {
 
 impl<B: Backend> KvBridge<B> {
     pub fn new(backend: Arc<B>, notify_interval: Duration, emulated_etcd_version: String) -> Self {
-        Self { backend, notify_interval, emulated_etcd_version }
+        Self {
+            backend,
+            notify_interval,
+            emulated_etcd_version,
+        }
     }
 }

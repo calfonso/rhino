@@ -5,14 +5,17 @@
 //! row IDs; all mutations are appended as new rows. A background poll loop
 //! detects new rows and broadcasts them to watchers.
 
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteLockingMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::Row;
-use tokio::sync::{mpsc, Mutex, Notify};
+use sqlx::sqlite::{
+    SqliteConnectOptions, SqliteJournalMode, SqliteLockingMode, SqlitePool, SqlitePoolOptions,
+    SqliteSynchronous,
+};
+use tokio::sync::{Mutex, Notify, mpsc};
 use tracing::{debug, error, trace, warn};
 
 use crate::backend::{Backend, BackendError, Event, KeyValue, Result, WatchResult};
@@ -79,15 +82,13 @@ impl Broadcaster {
     async fn send(&self, events: Vec<Event>) {
         let events = Arc::new(events);
         let mut subs = self.subscribers.lock().await;
-        subs.retain(|tx| {
-            match tx.try_send(Arc::clone(&events)) {
-                Ok(()) => true,
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    warn!("dropping slow watch subscriber");
-                    false
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => false,
+        subs.retain(|tx| match tx.try_send(Arc::clone(&events)) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!("dropping slow watch subscriber");
+                false
             }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
         });
     }
 }
@@ -536,12 +537,22 @@ impl SqliteBackend {
 
         let is_create = created != 0;
         let is_delete = deleted != 0;
-        let actual_create_rev = if is_create { mod_revision } else { create_revision };
+        let actual_create_rev = if is_create {
+            mod_revision
+        } else {
+            create_revision
+        };
 
         let kv = KeyValue {
             key: name.clone(),
             value,
-            version: 0,
+            // etcd `version` is 1 on a key's first creation, >1 on updates.
+            // Watch consumers (e.g. the rusternetes api-server) map version==1
+            // -> ADDED, otherwise MODIFIED, so it MUST be set on watch events;
+            // a hardcoded 0 makes every create look like an update. The exact
+            // update count isn't tracked in the streaming path — any value >1
+            // correctly reads as "not a create".
+            version: if is_create { 1 } else { 2 },
             create_revision: actual_create_rev,
             mod_revision,
             lease,
@@ -553,7 +564,7 @@ impl SqliteBackend {
             Some(KeyValue {
                 key: name,
                 value: old_value,
-                version: 0,
+                version: 1,
                 create_revision: actual_create_rev,
                 mod_revision: prev_revision,
                 lease,
@@ -598,7 +609,11 @@ impl SqliteBackend {
         let is_create = created != 0;
         let is_delete = deleted != 0;
 
-        let actual_create_rev = if is_create { mod_revision } else { create_revision };
+        let actual_create_rev = if is_create {
+            mod_revision
+        } else {
+            create_revision
+        };
 
         let kv = KeyValue {
             key: name.clone(),
@@ -772,12 +787,7 @@ impl SqliteBackend {
 
             if rev > poll_revision {
                 self.current_rev
-                    .compare_exchange(
-                        poll_revision,
-                        rev,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
+                    .compare_exchange(poll_revision, rev, Ordering::AcqRel, Ordering::Acquire)
                     .ok();
                 poll_revision = rev;
 
@@ -813,10 +823,7 @@ impl SqliteBackend {
 
         let now = Instant::now();
         for (name, lease, mod_rev) in rows {
-            expiries.insert(
-                name,
-                (mod_rev, now + Duration::from_secs(lease as u64)),
-            );
+            expiries.insert(name, (mod_rev, now + Duration::from_secs(lease as u64)));
         }
 
         // Subscribe to broadcaster to track new leased keys
@@ -1035,7 +1042,10 @@ impl Backend for SqliteBackend {
         self.ensure_compact_rev_key().await?;
 
         // Create health check key (like kine does)
-        match self.create("/registry/health", b"{\"health\":\"true\"}", 0).await {
+        match self
+            .create("/registry/health", b"{\"health\":\"true\"}", 0)
+            .await
+        {
             Ok(_) | Err(BackendError::KeyExists) => {}
             Err(e) => warn!("failed to create health check key: {e}"),
         }
@@ -1061,14 +1071,12 @@ impl Backend for SqliteBackend {
         let (_rev, existing) = self.get_internal(key, 0, true, false).await?;
 
         if let Some(ref event) = existing
-            && !event.delete {
-                return Err(BackendError::KeyExists);
-            }
+            && !event.delete
+        {
+            return Err(BackendError::KeyExists);
+        }
 
-        let prev_revision = existing
-            .as_ref()
-            .map(|e| e.kv.mod_revision)
-            .unwrap_or(0);
+        let prev_revision = existing.as_ref().map(|e| e.kv.mod_revision).unwrap_or(0);
 
         let old_value = existing
             .as_ref()
@@ -1192,7 +1200,14 @@ impl Backend for SqliteBackend {
         };
 
         let (rev, events) = self
-            .list_internal(&like_prefix, effective_start, limit, revision, false, keys_only)
+            .list_internal(
+                &like_prefix,
+                effective_start,
+                limit,
+                revision,
+                false,
+                keys_only,
+            )
             .await?;
 
         let kvs = events.into_iter().map(|e| e.kv).collect();
@@ -1377,8 +1392,7 @@ impl Backend for SqliteBackend {
                     prefix.clone()
                 };
 
-                let sql =
-                    "SELECT
+                let sql = "SELECT
                         kv.id AS theid,
                         kv.name AS thename,
                         kv.created,
@@ -1416,7 +1430,11 @@ impl Backend for SqliteBackend {
 
                         let is_create = created != 0;
                         let is_delete = deleted != 0;
-                        let actual_create_rev = if is_create { mod_revision } else { create_revision };
+                        let actual_create_rev = if is_create {
+                            mod_revision
+                        } else {
+                            create_revision
+                        };
 
                         events.push(Event {
                             create: is_create,
@@ -1424,7 +1442,12 @@ impl Backend for SqliteBackend {
                             kv: KeyValue {
                                 key: name.clone(),
                                 value,
-                                version: 0,
+                                // version==1 marks a create; >1 an update. See
+                                // row_to_event_poll for why this MUST be set
+                                // (consumers map version==1 -> ADDED). Historical
+                                // replay needs it too: watches starting from a
+                                // past revision replay creates as ADDED.
+                                version: if is_create { 1 } else { 2 },
                                 create_revision: actual_create_rev,
                                 mod_revision,
                                 lease,
@@ -1435,7 +1458,7 @@ impl Backend for SqliteBackend {
                                 Some(KeyValue {
                                     key: name,
                                     value: old_value,
-                                    version: 0,
+                                    version: 1,
                                     create_revision: actual_create_rev,
                                     mod_revision: prev_revision,
                                     lease,
@@ -1446,12 +1469,14 @@ impl Backend for SqliteBackend {
 
                     // Track the last revision delivered via historical events so we
                     // can skip duplicates from the broadcaster below.
-                    last_seen_rev = events.last().map(|e| e.kv.mod_revision).unwrap_or(last_seen_rev);
+                    last_seen_rev = events
+                        .last()
+                        .map(|e| e.kv.mod_revision)
+                        .unwrap_or(last_seen_rev);
 
-                    if !events.is_empty()
-                        && tx.send(events).await.is_err() {
-                            return;
-                        }
+                    if !events.is_empty() && tx.send(events).await.is_err() {
+                        return;
+                    }
                 }
             }
 
@@ -1473,10 +1498,9 @@ impl Backend for SqliteBackend {
                             })
                             .cloned()
                             .collect();
-                        if !filtered.is_empty()
-                            && tx.send(filtered).await.is_err() {
-                                return;
-                            }
+                        if !filtered.is_empty() && tx.send(filtered).await.is_err() {
+                            return;
+                        }
                     }
                     None => {
                         return;

@@ -1,8 +1,8 @@
 use tonic::{Request, Response, Status};
 
 use crate::backend::Backend;
-use crate::proto::etcdserverpb::*;
 use crate::proto::etcdserverpb::cluster_server::Cluster;
+use crate::proto::etcdserverpb::*;
 
 use super::KvBridge;
 
